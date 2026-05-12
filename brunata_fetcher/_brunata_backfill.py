@@ -105,11 +105,24 @@ async def _fetch_history(
     years.sort(key=lambda y: y["abdatum"])
     _LOGGER.info("Backfill: discovered %d historical years", len(years))
 
+    today = date.today()
     results: list[dict] = []
     for year_info in years:
-        bisdatum = year_info["bisdatum"]
-        bis_literal = f"datetime'{bisdatum}T00:00:00'"
         year = int(year_info["abdatum"][:4])
+        bisdatum = year_info["bisdatum"]
+        # For the current year, override Bisdatum from "last completed month-end"
+        # to "end of current month" so the API also returns the preliminary
+        # in-progress month. This is the same trick the live fetch uses, and
+        # it shrinks the gap between the last backfilled day and the first
+        # live sample down to hours — important because HA's stats compile
+        # falls back to sum=0 when it can't find a recent baseline.
+        if year == today.year:
+            if today.month == 12:
+                month_end = date(today.year, 12, 31)
+            else:
+                month_end = date(today.year, today.month + 1, 1) - timedelta(days=1)
+            bisdatum = month_end.isoformat()
+        bis_literal = f"datetime'{bisdatum}T00:00:00'"
 
         inner_gets: list[str] = []
         index_map: list[tuple[str, str]] = []
@@ -215,20 +228,30 @@ def _emit_daily_stats(
     start of each iteration (caller resets it per-year if needed); ``sum``
     grows monotonically from ``starting_sum``.
 
-    Days at or after ``cutoff`` are skipped — that's where live polling
-    will own the data and we don't want to overwrite it.
+    For the in-progress current month, the monthly value is the portal's
+    preliminary cumulative-so-far reading. We divide it across the days
+    that have actually elapsed (today inclusive), not the calendar length
+    of the month — otherwise the daily values would be too low and there'd
+    be a fake "missing consumption" jump when live polling first lands.
+
+    Days at or after ``cutoff`` are skipped.
     """
+    today = date.today()
     stats: list[dict] = []
     ytd_state = 0.0
     running_sum = starting_sum
 
     for datum_iso, monthly_value in monthly_rows:
-        month_start, _, days_in_month = _month_bounds(datum_iso)
-        daily_value = monthly_value / days_in_month
+        month_start, month_end, days_in_month = _month_bounds(datum_iso)
+        if month_start <= today <= month_end:
+            # Current in-progress month: distribute over days elapsed so far.
+            denom = max(1, (today - month_start).days + 1)
+        else:
+            denom = days_in_month
+        daily_value = monthly_value / denom
         for day_offset in range(days_in_month):
             day = month_start + timedelta(days=day_offset)
             if cutoff is not None and day >= cutoff:
-                # Stop before the live-data window starts.
                 return stats, running_sum
             stats.append(
                 {
@@ -530,11 +553,13 @@ async def backfill_history(
         )
         unique_id_map = {}
 
-    # The live-polling path owns the current calendar month. Cut backfill at
-    # the first day of it so we don't overwrite the addon's real daily samples.
+    # Backfill through today inclusive — including a daily interpolation
+    # of the in-progress month from the portal's preliminary value. This
+    # leaves no time gap for HA's stats compile to "lose" the baseline
+    # when the next live sample lands.
     today = date.today()
-    cutoff = today.replace(day=1)
-    _LOGGER.info("Backfill: cutoff = %s (start of current month)", cutoff)
+    cutoff = today + timedelta(days=1)
+    _LOGGER.info("Backfill: cutoff = %s (today inclusive)", cutoff)
 
     # Build the full list of (statistic_id, unit, name, stats) tuples first.
     # We resolve all the IDs up front so we can clear them all in one

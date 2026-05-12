@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.9
+
+- Backfill now includes the current in-progress month too, distributing
+  the portal's preliminary value across the days that have actually
+  elapsed. Without this, there used to be a multi-day gap between the
+  last backfilled day and the first live sample, and Home Assistant
+  would sometimes render the gap as a giant negative bar in the Energy
+  Dashboard. Re-run the backfill after upgrading to clear that out.
+
 ## 0.3.8
 
 - Backfill now clears each entity's existing statistics before
