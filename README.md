@@ -1,125 +1,168 @@
 # Brunata Fetcher Home Assistant Add-on
 
-Home Assistant add-on that logs in to the Brunata user portal, fetches
-consumption data, and publishes entities via MQTT Discovery.
+Home Assistant add-on that logs in to the Brunata München Nutzerportal,
+pulls consumption data through the portal's OData API, and publishes
+entities via MQTT Discovery.
 
-Keywords: Brunata München Nutzerportal, BRUdirekt, BRUNATA-METRONA
+Keywords: Brunata München Nutzerportal, BRUdirekt, BRUNATA-METRONA.
 
 ## Features
 
-- Scrapes Brunata portal data with Playwright inside the add-on container
-- Publishes Home Assistant MQTT Discovery topics automatically
-- Supports the energy types `Heizung`, `Kaltwasser`, and `Warmwasser`
-- Uses Supervisor MQTT service discovery when manual MQTT settings are empty
-- Provides portal query health as a binary sensor (`device_class: problem`)
-- Sends a Home Assistant persistent notification when portal queries fail
+- Cookie-authed OData fetch (~10 s per cycle, no DOM-scrape brittleness)
+- Energy types `Heizung`, `Kaltwasser`, `Warmwasser`
+- **Per-room heating breakdown** in kWh, derived from the portal's
+  `Raumvergleich` distribution × the heating YTD total
+- **Building-average comparison** percentage per cost type (your usage as a
+  % of the building average)
+- Includes the portal's preliminary in-progress-month value, so the HA
+  Energy Dashboard stays current between Brunata's monthly meter reads
+- MQTT Discovery (no manual entity setup)
+- Supervisor MQTT service discovery when manual MQTT settings are empty
+- Portal-health binary sensor (`device_class: problem`) plus a persistent
+  HA notification when fetches fail
 
 ## Requirements
 
 - Home Assistant OS / Supervised with Add-on Store
-- MQTT broker available (for example `core-mosquitto`)
+- An MQTT broker reachable from HA (e.g. `core-mosquitto`)
 - Brunata portal credentials (`email`, `password`)
 
 ## Installation
 
-1. Add this repository in Home Assistant Add-on Store.
-2. Install `Brunata Fetcher`.
-3. Configure required options (`email`, `password`).
-4. Start the add-on and check log (fetch duration ~20s).
-5. Verify entities appear in Home Assistant (MQTT: BRUdirekt).
+1. **Settings → Add-ons → Add-on Store → ⋮ → Repositories** and add
+   `https://github.com/ChristophHornung/brunata-fetcher-ha-addon`.
+2. Find **Brunata Fetcher** in the store and click **Install**. First
+   build takes a few minutes (Playwright + Chromium download into the
+   container image).
+3. Configure `email` and `password` (and MQTT options if not using
+   Supervisor auto-discovery).
+4. Start the add-on. Each fetch cycle runs in ~10 s; the default poll
+   interval is 24 h.
+5. New entities appear under the **BRUdirekt** MQTT device in HA.
 
 ## Configuration
 
 Main options:
 
-- `email` (required)
-- `password` (required)
-- `energy_types` (checkboxes)
-- `scan_interval_hours` (1..168)
+- `email` (required) — Brunata portal email
+- `password` (required) — Brunata portal password
+- `energy_types` — checkboxes for `Heizung`, `Kaltwasser`, `Warmwasser`
+- `scan_interval_hours` — 1 to 168
 
 Advanced options:
 
-- `mqtt_host`
-- `mqtt_port`
-- `mqtt_user`
-- `mqtt_password`
-- `scraper_url`
+- `mqtt_host` / `mqtt_port` / `mqtt_user` / `mqtt_password` — leave empty
+  to let the add-on resolve MQTT through Supervisor's `/services/mqtt`
+- `debug` — when on, the add-on writes `portal_debug{1..5}.{html,png}`
+  and `portal_network.jsonl` to the container's temp dir for diagnosis.
+  Off by default.
 
-Notes:
-
-- If advanced MQTT host/user/password are left empty, the add-on attempts to
-  use Supervisor service discovery (`/services/mqtt`).
-- `mqtt_port` remains configurable and defaults to `1883`.
+The `scraper_url` advanced option is preserved for back-compat but no
+longer drives behaviour — the OData endpoints are hard-coded.
 
 ## Published entities
 
-Core sensors:
+A default setup (all three energy types, a typical apartment with six
+rooms) gives you 16 entities under the **BRUdirekt** MQTT device.
 
-- Energy sensors for selected energy types
-- `Letztes Update` (portal update date)
-- `Letzte Portal-Abfrage` (timestamp)
-- `Naechste Portal-Abfrage` (timestamp)
+Energy totals (`state_class: total_increasing`, Energy Dashboard ready):
 
-Health sensor:
+- `sensor.brunata_fetcher_heizung` — kWh
+- `sensor.brunata_fetcher_kaltwasser` — m³
+- `sensor.brunata_fetcher_warmwasser` — kWh
 
-- `Portal-Abfrage Problem` (binary sensor)
-  - `ON` means latest portal query failed
-  - `OFF` means latest portal query succeeded
-  - Icon switches dynamically:
-    - healthy: `mdi:check-decagram-outline`
-    - problem: `mdi:alert-decagram-outline`
+Per-room heating (kWh, `total_increasing`, registered dynamically the
+first time each room is seen):
+
+- `sensor.brunata_fetcher_heizung_<room>` — one per room reported by the
+  portal (typically Bad, Esszimmer, Kinderzimmer, Küche, Schlafzimmer,
+  Wohnzimmer)
+
+Building-average comparison (your value as a percentage of the building
+average):
+
+- `sensor.brunata_fetcher_heizung_vs_avg`
+- `sensor.brunata_fetcher_kaltwasser_vs_avg`
+- `sensor.brunata_fetcher_warmwasser_vs_avg`
+
+Metadata + health:
+
+- `sensor.brunata_fetcher_last_update` — date of the last fully-closed
+  month the portal published (stable, ticks ~monthly)
+- `sensor.brunata_fetcher_last_portal_query` — timestamp of the last
+  fetch cycle
+- `sensor.brunata_fetcher_next_portal_query` — timestamp of the next
+  planned fetch
+- `binary_sensor.brunata_fetcher_portal_query_problem` —
+  `device_class: problem`. `ON` if the latest fetch failed validation,
+  `OFF` otherwise; icon toggles between `mdi:check-decagram-outline` and
+  `mdi:alert-decagram-outline`
+
+You can rename any entity in HA without breaking the add-on — the
+`unique_id` published over MQTT Discovery is the stable anchor.
 
 ## How query success is evaluated
 
-A query is considered successful only if:
+A cycle is treated as successful only if:
 
-- at least one configured energy value is present, and
-- `last_update_date` is present and plausible in format `DD.MM.YYYY`
+- at least one configured energy value is present in the response, **and**
+- `last_update_date` is present and plausible (`DD.MM.YYYY`, not in the
+  future, not before 2000-01-01).
 
-If validation fails, the query is treated as failed.
+A failed cycle flips the health binary sensor to `ON` and fires a
+persistent notification.
 
 ## Troubleshooting
 
-- Check add-on logs first.
-- Verify `SUPERVISOR_TOKEN present: true` is logged at startup.
-- Verify MQTT connection logs (`MQTT broker connection acknowledged`).
-- If no entities appear, confirm MQTT integration is enabled in Home Assistant.
-- If portal fails repeatedly, check credentials and whether Brunata selectors
-  still match the current portal UI.
+- Add-on log first. Startup logs `SUPERVISOR_TOKEN present: true` and
+  `MQTT broker connection acknowledged` on a healthy boot.
+- `LOGIN_FAILED` in the log → check `email` / `password`.
+- A `/BME/KP_MSG_CORE/224` 500 from the portal → likely an API change.
+  See `docs/portal-api.md` for the reverse-engineered protocol, then
+  flip `advanced.debug: true` to capture `portal_network.jsonl`.
+- No entities appear → confirm the HA MQTT integration is loaded and the
+  broker is reachable.
 
 ## Related projects and portal compatibility
 
-These projects are useful references, but they target different portal stacks.
+These projects exist but target other Brunata portal stacks and won't
+authenticate against the Munich BRUdirekt portal:
 
-1. `Minol-MQTT-Bridge`:
-  https://github.com/Gr4ph1xZ/Minol-MQTT-Bridge
-  Portal: `https://minolauth.b2clogin.com/` (Brunata Minol)
-2. `hacs-brunata`:
-  https://codeberg.org/YukiElectronics/hacs-brunata
-  Portals: `https://online.brunata.com/`,
-  `https://brunatab2cprod.b2clogin.com/`
-3. `brunata-to-home-assistant`:
-  https://github.com/patricklind/brunata-to-home-assistant
-  Portals: same as #2 (`online.brunata.com`, `brunatab2cprod.b2clogin.com`)
+1. `Minol-MQTT-Bridge` — https://github.com/Gr4ph1xZ/Minol-MQTT-Bridge
+   (`https://minolauth.b2clogin.com/`)
+2. `hacs-brunata` — https://codeberg.org/YukiElectronics/hacs-brunata
+   (`https://online.brunata.com/`, `brunatab2cprod.b2clogin.com/`)
+3. `brunata-to-home-assistant` —
+   https://github.com/patricklind/brunata-to-home-assistant
+   (same portals as #2)
 
-Important compatibility note:
-
-- This add-on targets the Brunata Muenchen Nutzerportal / BRUdirekt login flow.
-- My BRUdirekt credentials for the Brunata Muenchen portal did not work with
-  the other portal stacks listed above.
+This add-on targets the Brunata München Nutzerportal (BRUdirekt) flow
+only.
 
 ## Development notes
 
-- Runtime behavior is implemented in `brunata_fetcher/server.py`.
-- Scraping logic is in `brunata_fetcher/_brunata_scraper.py`.
-- Local smoke checks: `python3 brunata_fetcher/smoke_local.py`
-- Local one-shot scraper run with `.env` credentials:
-  - `cp brunata_fetcher/.env.example brunata_fetcher/.env`
-  - Edit `brunata_fetcher/.env` and set `BRUNATA_EMAIL` and `BRUNATA_PASSWORD`
-  - Run: `cd brunata_fetcher && python3 run_scraper_once.py --env-file .env`
+- Architecture overview + protocol reference: `docs/portal-api.md`
+- Guidance for AI assistants / contributors: `CLAUDE.md`
+- Production fetch path: `brunata_fetcher/_brunata_api.py`
+- Legacy DOM-scraping path (kept for fallback / future investigation):
+  `brunata_fetcher/_brunata_scraper.py`
 - Release history: `brunata_fetcher/CHANGELOG.md`
-- Session handover and archived context:
-  - `docs/SESSION_HANDOVER.md`
-  - `docs/MEMORIES_ARCHIVE.md`
-- local one-shot scraper runner for development outside Home Assistant add-on runtime (`python3 run_scraper_once.py --env-file .env`)
-- `.env.example` template for local credential-based scraper testing
+
+Local development:
+
+```bash
+cp brunata_fetcher/.env.example brunata_fetcher/.env
+# Edit BRUNATA_EMAIL + BRUNATA_PASSWORD
+
+cd brunata_fetcher
+pip install -r requirements.txt
+python -m playwright install chromium     # one-time ~300 MB download
+
+python smoke_local.py                     # parser + MQTT payload check, offline
+python run_api_once.py                    # current production fetch path
+python run_scraper_once.py                # legacy DOM scraper
+python explore_portal.py                  # interactive non-headless explorer
+```
+
+`BRUNATA_DEBUG=true` in `.env` writes HTML / screenshot / network-log
+dumps to the system temp dir during any of the runs above.
