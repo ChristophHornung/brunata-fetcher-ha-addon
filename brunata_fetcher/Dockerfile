@@ -1,5 +1,5 @@
-ARG BUILD_FROM
-FROM ${BUILD_FROM}
+ARG BUILD_ARCH
+FROM ghcr.io/home-assistant/${BUILD_ARCH}-base-debian:bookworm
 
 # Python runtime. The HA base is minimal; install python + pip and drop the
 # apt lists in the same layer so they don't bloat the image.
