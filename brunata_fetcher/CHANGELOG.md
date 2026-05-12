@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2
+
+- Per-room heating sensors now live on their own logical HA devices
+  ("Heizkostenverteiler Kinderzimmer", "Heizkostenverteiler Bad", …)
+  linked to the main BRUdirekt device via `via_device`. This lets each
+  room be assigned to the matching HA Area for per-room dashboards.
+  Entity `unique_id`s are unchanged, so existing history is preserved —
+  the entities just migrate to the new devices on first publish after
+  upgrading.
+- Dropped the deprecated `build.yaml`; the base image is now constructed
+  directly in the Dockerfile from `BUILD_ARCH`. No image-content change.
+
 ## 0.3.1
 
 - Switched the container image to `playwright install chromium-headless-shell`

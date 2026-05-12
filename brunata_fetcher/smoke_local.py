@@ -169,6 +169,44 @@ def _assert_discovery_and_state() -> None:
             "Unexpected suggested_display_precision in Kaltwasser payload"
         )
 
+    # Per-room entities each live on their own logical device, linked back
+    # to the main BRUdirekt device via via_device.
+    room_payload = next(
+        payload
+        for topic, payload, _ in client.published
+        if topic == "homeassistant/sensor/brunata_fetcher/heizung_kinderzimmer/config"
+    )
+    room_discovery = json.loads(room_payload)
+    room_device = room_discovery["device"]
+    if room_device.get("identifiers") != ["brunata_fetcher_room_kinderzimmer"]:
+        raise AssertionError(
+            f"Per-room device must have its own identifiers, got: {room_device}"
+        )
+    if room_device.get("via_device") != "brunata_fetcher":
+        raise AssertionError(
+            f"Per-room device must link to main device via via_device, got: {room_device}"
+        )
+    if "Kinderzimmer" not in room_device.get("name", ""):
+        raise AssertionError(
+            f"Per-room device name should include room label, got: {room_device.get('name')}"
+        )
+    if room_discovery.get("name") != "Heizung":
+        raise AssertionError(
+            f"Per-room entity name should be 'Heizung', got: {room_discovery.get('name')}"
+        )
+
+    # The main consumption entities stay on the BRUdirekt device.
+    heating_total_payload = next(
+        payload
+        for topic, payload, _ in client.published
+        if topic == "homeassistant/sensor/brunata_fetcher/heizung/config"
+    )
+    main_device = json.loads(heating_total_payload)["device"]
+    if main_device.get("identifiers") != ["brunata_fetcher"]:
+        raise AssertionError(
+            f"Main consumption entity must stay on BRUdirekt device, got: {main_device}"
+        )
+
     if not all(retain for _, _, retain in client.published):
         raise AssertionError("All publish calls must be retained for this smoke test")
 

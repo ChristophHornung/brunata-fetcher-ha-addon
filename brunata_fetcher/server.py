@@ -374,12 +374,29 @@ def _publish_comparison_discovery(client: mqtt.Client, energy_type: str) -> None
     _publish_mqtt(client, _discovery_topic(object_id), json.dumps(payload))
 
 
+def _room_device_info(room_label: str, slug: str) -> dict:
+    """Per-room device dict, linked to the main BRUdirekt device via via_device.
+
+    Modelling each room as its own logical HA device lets the user assign it
+    to the matching HA Area and group room-specific entities there. The
+    ``via_device`` link keeps them visually nested under BRUdirekt in the
+    Devices list.
+    """
+    return {
+        "identifiers": [f"brunata_fetcher_room_{slug}"],
+        "name": f"Heizkostenverteiler {room_label}",
+        "manufacturer": "BRUNATA-METRONA",
+        "model": "Heizkostenverteiler",
+        "via_device": "brunata_fetcher",
+    }
+
+
 def _publish_room_discovery(client: mqtt.Client, room_label: str) -> None:
     """Publish discovery config for a per-room heating kWh entity."""
     slug = _slug_for_room(room_label)
     object_id = f"heizung_{slug}"
     payload = {
-        "name": f"Heizung {room_label}",
+        "name": "Heizung",
         "unique_id": f"brunata_fetcher_{object_id}",
         "state_topic": f"brunata_fetcher/sensor/{object_id}/state",
         "unit_of_measurement": "kWh",
@@ -387,7 +404,7 @@ def _publish_room_discovery(client: mqtt.Client, room_label: str) -> None:
         "state_class": "total_increasing",
         "suggested_display_precision": 0,
         "icon": "mdi:radiator",
-        "device": _DEVICE_INFO,
+        "device": _room_device_info(room_label, slug),
     }
     _publish_mqtt(client, _discovery_topic(object_id), json.dumps(payload))
 
