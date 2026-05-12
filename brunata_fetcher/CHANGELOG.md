@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.4
+
+- New: historical data backfill. The Brunata portal exposes monthly
+  consumption back to 2023; you can pull all of it into Home Assistant
+  as long-term statistics, so the Energy Dashboard shows
+  year-over-year comparisons from day one instead of only what the
+  add-on has polled since install. Per-room heating history is
+  included too. Months are linearly distributed across their days, so
+  daily and weekly views look smooth.
+
+  To trigger it: Developer Tools → Actions → `mqtt.publish` →
+  topic `brunata_fetcher/cmd/backfill`, empty payload. The backfill
+  runs once in the background (a couple of minutes) and skips the
+  current month so it doesn't conflict with live polling. You can
+  re-run it later if you want — existing statistics at the same
+  timestamps are replaced safely.
+
 ## 0.3.3
 
 - More reliable login on slower hardware (Raspberry Pi-class with an SD

@@ -21,6 +21,7 @@ from urllib import request as urlrequest
 import paho.mqtt.client as mqtt
 
 from _brunata_api import fetch as _brunata_fetch
+from _brunata_backfill import backfill_history as _brunata_backfill
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,6 +94,8 @@ _LEGACY_PORTAL_QUERY_SUCCESS_STATE_TOPIC = (
     "brunata_fetcher/binary_sensor/last_portal_query_success/state"
 )
 _PERSISTENT_NOTIFICATION_ID = "brunata_fetcher_portal_query_failed"
+
+_BACKFILL_COMMAND_TOPIC = "brunata_fetcher/cmd/backfill"
 
 
 # --- MQTT helpers ------------------------------------------------------------
@@ -712,6 +715,42 @@ async def _run_fetch(options: dict) -> dict | None:
     return None
 
 
+# --- Backfill watcher -------------------------------------------------------
+
+
+async def _backfill_watcher(
+    event: asyncio.Event,
+    lock: asyncio.Lock,
+    options: dict,
+    energy_types: list[str],
+) -> None:
+    """Run the historical backfill whenever its MQTT command fires."""
+    while True:
+        await event.wait()
+        event.clear()
+        token = _get_supervisor_token()
+        if not token:
+            _LOGGER.error(
+                "Backfill requested but SUPERVISOR_TOKEN is unavailable; "
+                "cannot call HA recorder.import_statistics. Skipping."
+            )
+            continue
+        async with lock:
+            try:
+                _LOGGER.info("Backfill: acquired Playwright lock, starting")
+                await _brunata_backfill(
+                    supervisor_token=token,
+                    email=options["email"],
+                    password=options["password"],
+                    energy_types=energy_types,
+                    headless=True,
+                    playwright_timeout=60000,
+                )
+                _LOGGER.info("Backfill: complete")
+            except Exception:
+                _LOGGER.exception("Backfill failed")
+
+
 # --- Main loop ---------------------------------------------------------------
 
 
@@ -743,6 +782,27 @@ async def main() -> None:
     _publish_discovery(mqtt_client, energy_types)
     _clear_removed_energy_type_entities(mqtt_client, energy_types)
 
+    # Serialize Playwright between live fetches and on-demand backfills so we
+    # don't launch two Chromium instances at once on memory-constrained hosts.
+    playwright_lock = asyncio.Lock()
+    backfill_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _on_mqtt_message(
+        _client: mqtt.Client, _userdata: object, msg: mqtt.MQTTMessage
+    ) -> None:
+        if msg.topic == _BACKFILL_COMMAND_TOPIC:
+            _LOGGER.info("MQTT backfill command received")
+            loop.call_soon_threadsafe(backfill_event.set)
+
+    mqtt_client.on_message = _on_mqtt_message
+    mqtt_client.subscribe(_BACKFILL_COMMAND_TOPIC)
+    _LOGGER.info("Subscribed to backfill command topic: %s", _BACKFILL_COMMAND_TOPIC)
+
+    asyncio.create_task(
+        _backfill_watcher(backfill_event, playwright_lock, options, energy_types)
+    )
+
     cycle = 0
     failure_notification_sent = False
     portal_query_problem_icon: str | None = None
@@ -752,7 +812,8 @@ async def main() -> None:
         cycle_start = time.monotonic()
         run_started_at = datetime.now(UTC)
         _LOGGER.info("Cycle %d starting fetch", cycle)
-        data = await _run_fetch(options)
+        async with playwright_lock:
+            data = await _run_fetch(options)
         is_valid_result = False
         if data is not None:
             is_valid_result, invalid_reason = _validate_scrape_result(data, energy_types)
