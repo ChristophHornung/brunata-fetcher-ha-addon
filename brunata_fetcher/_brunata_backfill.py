@@ -322,6 +322,47 @@ async def _ws_auth(ws, supervisor_token: str) -> None:
         raise RuntimeError(f"HA WebSocket auth failed: {msg}")
 
 
+async def _clear_existing_statistics(
+    supervisor_token: str, statistic_ids: list[str]
+) -> None:
+    """Clear all existing statistics for the given statistic_ids.
+
+    The live-polling path generates its own statistics for these entities
+    starting from sum=0 (HA's default initialization). If we backfill without
+    clearing first, HA ends up with two disjoint "histories" for the same
+    entity — the backfilled one with a cumulative sum, and the live one
+    rebased to zero. The Energy Dashboard / Statistics Graph then computes
+    the bridge bucket as ``small_live_sum - huge_backfill_sum``, producing
+    a huge negative bar.
+
+    Clearing the existing stats lets HA's compiler recompute from the
+    backfilled baseline once new short-term samples come in.
+    """
+    if not statistic_ids:
+        return
+    import websockets
+
+    async with websockets.connect(_WS_URI, max_size=2**24) as ws:
+        await _ws_auth(ws, supervisor_token)
+        await ws.send(
+            json.dumps(
+                {
+                    "id": 1,
+                    "type": "recorder/clear_statistics",
+                    "statistic_ids": statistic_ids,
+                }
+            )
+        )
+        msg = json.loads(await ws.recv())
+    if not msg.get("success"):
+        raise RuntimeError(f"recorder/clear_statistics failed: {msg}")
+    _LOGGER.info(
+        "Cleared existing statistics for %d entities: %s",
+        len(statistic_ids),
+        statistic_ids,
+    )
+
+
 async def _fetch_unique_id_to_entity_id(supervisor_token: str) -> dict[str, str]:
     """Return ``{unique_id: current_entity_id}`` for this addon's entities.
 
@@ -495,8 +536,12 @@ async def backfill_history(
     cutoff = today.replace(day=1)
     _LOGGER.info("Backfill: cutoff = %s (start of current month)", cutoff)
 
-    ws_id = 1
-    # Global per-energy-type sensors.
+    # Build the full list of (statistic_id, unit, name, stats) tuples first.
+    # We resolve all the IDs up front so we can clear them all in one
+    # WebSocket call before importing — otherwise live-polling stats with
+    # a from-zero sum baseline would coexist with our backfilled cumulative
+    # sums and HA would render a giant negative bar at the seam.
+    plan: list[tuple[str, str, str, list[dict]]] = []
     for energy_type in energy_types:
         entity_unit = _ENTITY_ID_FOR_ENERGY_TYPE.get(energy_type)
         if entity_unit is None:
@@ -507,22 +552,15 @@ async def backfill_history(
         statistic_id = _resolve_statistic_id(
             unique_id_map, unique_id, default_statistic_id
         )
-        stats = _stats_for_energy_type(years_data, energy_type, cutoff)
-        await _push_statistics(
-            supervisor_token,
-            statistic_id,
-            unit,
-            name=energy_type,
-            stats=stats,
-            ws_message_id=ws_id,
+        plan.append(
+            (
+                statistic_id,
+                unit,
+                energy_type,
+                _stats_for_energy_type(years_data, energy_type, cutoff),
+            )
         )
-        ws_id += 1
 
-    # Per-room heating sensors. We backfill every room that has ever appeared
-    # in the history. If a room currently doesn't exist (renamed, removed),
-    # its sensor in HA may not yet exist — HA will still accept the import
-    # and create the row; once Discovery republishes the entity it will be
-    # linked back up.
     if "Heizung" in energy_types:
         for room_label in _all_room_labels(years_data):
             slug = _slug_for_room(room_label)
@@ -533,16 +571,39 @@ async def backfill_history(
             statistic_id = _resolve_statistic_id(
                 unique_id_map, unique_id, default_statistic_id
             )
-            stats = _stats_for_room(years_data, room_label, cutoff)
-            await _push_statistics(
-                supervisor_token,
-                statistic_id,
-                "kWh",
-                name=f"Heizung {room_label}",
-                stats=stats,
-                ws_message_id=ws_id,
+            plan.append(
+                (
+                    statistic_id,
+                    "kWh",
+                    f"Heizung {room_label}",
+                    _stats_for_room(years_data, room_label, cutoff),
+                )
             )
-            ws_id += 1
+
+    statistic_ids_to_clear = [
+        statistic_id for statistic_id, _, _, stats in plan if stats
+    ]
+    try:
+        await _clear_existing_statistics(supervisor_token, statistic_ids_to_clear)
+    except Exception as ex:
+        _LOGGER.warning(
+            "Backfill: clear_statistics failed (%s); the imported stats will"
+            " coexist with any existing live-baseline stats and may produce a"
+            " transient discontinuity bar",
+            ex,
+        )
+
+    ws_id = 1
+    for statistic_id, unit, name, stats in plan:
+        await _push_statistics(
+            supervisor_token,
+            statistic_id,
+            unit,
+            name=name,
+            stats=stats,
+            ws_message_id=ws_id,
+        )
+        ws_id += 1
 
     duration = time.monotonic() - start
     _LOGGER.info("Backfill: done in %.1fs", duration)

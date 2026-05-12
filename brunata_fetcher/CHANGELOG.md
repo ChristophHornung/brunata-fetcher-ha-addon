@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.8
+
+- Backfill now clears each entity's existing statistics before
+  importing. Without this step, the historical data and the
+  recent live-polling data could end up on independent cumulative
+  baselines, producing a large negative bar in the Energy Dashboard
+  for the month where they meet. Re-running the backfill after
+  upgrading replaces the imported history cleanly.
+
 ## 0.3.7
 
 - Historical backfill now respects entity renames. If you've renamed
