@@ -22,6 +22,7 @@ from server import (
     _publish_discovery,
     _publish_schedule_state,
     _publish_state,
+    _slug_for_room,
     _validate_scrape_result,
 )
 
@@ -73,14 +74,28 @@ def _assert_discovery_and_state() -> None:
     energy_types = ["Heizung", "Kaltwasser"]
     _publish_discovery(client, energy_types)
     _clear_removed_energy_type_entities(client, energy_types)
+    rooms_discovered: set[str] = set()
     _publish_state(
         client,
         {
             "Heizung": 2150.0,
             "Kaltwasser": 12.5,
             "last_update_date": "28.02.2026",
+            "comparison_pct": {
+                "Heizung": 151.3,
+                "Kaltwasser": 109.2,
+            },
+            "rooms_kwh": {
+                "Kinderzimmer": 691.0,
+                "Küche": 94.0,
+            },
+            "rooms_pct": {
+                "Kinderzimmer": 32.15,
+                "Küche": 4.37,
+            },
         },
         energy_types,
+        rooms_discovered=rooms_discovered,
     )
     _publish_schedule_state(
         client,
@@ -92,24 +107,41 @@ def _assert_discovery_and_state() -> None:
     topics = [topic for topic, _, _ in client.published]
     expected_topics = {
         "homeassistant/sensor/brunata_fetcher/heizung/config",
+        "homeassistant/sensor/brunata_fetcher/heizung_vs_avg/config",
         "homeassistant/sensor/brunata_fetcher/kaltwasser/config",
+        "homeassistant/sensor/brunata_fetcher/kaltwasser_vs_avg/config",
         "homeassistant/sensor/brunata_fetcher/warmwasser/config",
         "homeassistant/sensor/brunata_fetcher/last_update/config",
         "homeassistant/sensor/brunata_fetcher/last_portal_query/config",
         "homeassistant/sensor/brunata_fetcher/next_portal_query/config",
         "homeassistant/binary_sensor/brunata_fetcher/portal_query_problem/config",
+        "homeassistant/sensor/brunata_fetcher/heizung_kinderzimmer/config",
+        "homeassistant/sensor/brunata_fetcher/heizung_kueche/config",
         "brunata_fetcher/sensor/heizung/state",
+        "brunata_fetcher/sensor/heizung_vs_avg/state",
         "brunata_fetcher/sensor/kaltwasser/state",
-        "brunata_fetcher/sensor/warmwasser/state",
+        "brunata_fetcher/sensor/kaltwasser_vs_avg/state",
         "brunata_fetcher/sensor/last_update/state",
         "brunata_fetcher/sensor/last_portal_query/state",
         "brunata_fetcher/sensor/next_portal_query/state",
         "brunata_fetcher/binary_sensor/portal_query_problem/state",
+        "brunata_fetcher/sensor/heizung_kinderzimmer/state",
+        "brunata_fetcher/sensor/heizung_kueche/state",
     }
 
     missing = expected_topics - set(topics)
     if missing:
         raise AssertionError(f"Missing expected MQTT topics: {sorted(missing)}")
+
+    if rooms_discovered != {"Kinderzimmer", "Küche"}:
+        raise AssertionError(
+            f"Unexpected rooms_discovered set: {rooms_discovered}"
+        )
+
+    if _slug_for_room("Küche") != "kueche":
+        raise AssertionError("Slug for Küche should fold to 'kueche'")
+    if _slug_for_room("Wohnzimmer Süd") != "wohnzimmer_sued":
+        raise AssertionError("Slug should ASCII-fold + replace spaces")
 
     discovery_payload = next(
         payload

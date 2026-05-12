@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+- Replaced Playwright DOM scraping with a cookie-authed OData fetcher
+  (`_brunata_api.py`). Playwright still handles the login itself, but data
+  retrieval now goes through SAP's `NP_UVI_SRV/$batch` directly — full cycle
+  ~10s instead of ~19s, no more selector-driven waits.
+- Added per-room heating sensors in kWh (computed from `Anteil` × YTD total).
+  One sensor per room found in `CumuConsumptionRoomSet`, discovered
+  dynamically.
+- Added "vs. Gebäude" comparison percentage sensors per energy type
+  (`heizung_vs_avg`, `kaltwasser_vs_avg`, `warmwasser_vs_avg`).
+- Documented the reverse-engineered portal API in `docs/portal-api.md`.
+- The DOM-scraping path (`_brunata_scraper.py`) and the interactive explorer
+  (`explore_portal.py`) are preserved for future investigations.
+
 ## 0.2.1
 
 - Hardened failure detection and scraping sequence

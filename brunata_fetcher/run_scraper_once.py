@@ -77,8 +77,8 @@ def _build_config_from_env(env: dict[str, str]) -> dict:
 
     login_url = env.get("BRUNATA_LOGIN_URL", _DEFAULT_LOGIN_URL).strip()
     headless = _env_bool(env.get("BRUNATA_HEADLESS", "true"), True)
+    debug = _env_bool(env.get("BRUNATA_DEBUG", ""), False)
     playwright_timeout = int(env.get("BRUNATA_PLAYWRIGHT_TIMEOUT_MS", "30000"))
-    timeout_before = int(env.get("BRUNATA_TIMEOUT_BEFORE_LOGIN_MS", "1000"))
     timeout_after = int(env.get("BRUNATA_TIMEOUT_AFTER_LOGIN_MS", "2000"))
     timeout_between = int(env.get("BRUNATA_TIMEOUT_BETWEEN_CLICKS_MS", "2000"))
 
@@ -88,11 +88,11 @@ def _build_config_from_env(env: dict[str, str]) -> dict:
         "energy_types": energy_types,
         "login_url": login_url,
         **_DEFAULT_SELECTORS,
-        "timeout_before_login": timeout_before,
         "timeout_after_login": timeout_after,
         "timeout_between_clicks": timeout_between,
         "playwright_timeout": playwright_timeout,
         "headless": headless,
+        "debug": debug,
         "energy_type_labels": {
             "Heizung": "Heizung in kWh",
             "Kaltwasser": "Kaltwasser in m3",

@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -19,7 +20,7 @@ from urllib import request as urlrequest
 
 import paho.mqtt.client as mqtt
 
-from _brunata_scraper import scrape
+from _brunata_api import fetch as _brunata_fetch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,15 +30,6 @@ logging.basicConfig(
 _LOGGER = logging.getLogger("brunata_fetcher")
 
 # --- Brunata portal constants ------------------------------------------------
-
-_DEFAULT_BRUNATA_LOGIN_URL = (
-    "https://nutzerportal.brunata-muenchen.de/np_anmeldung/index.html?sap-language=DE"
-)
-_SELECTOR_EMAIL = "#__component0---Start--idEmailInput-inner"
-_SELECTOR_PASSWORD = "#__component0---Start--idPassword-inner"
-_SELECTOR_LOGIN_BUTTON = 'button:has-text("Anmelden")'
-_SELECTOR_DATE = "#__xmlview1--idConsumptionDate-inner"
-_SELECTOR_VALUE = "#__xmlview1--idConsumptionValue-inner"
 
 _ENERGY_TYPES: dict[str, dict] = {
     "Heizung": {
@@ -67,8 +59,24 @@ _DEVICE_INFO = {
     "identifiers": ["brunata_fetcher"],
     "name": "BRUdirekt",
     "manufacturer": "BRUNATA-METRONA",
-    "model": "Nutzerportal Scraper",
+    "model": "Nutzerportal Fetcher",
 }
+
+def _slug_for_room(name: str) -> str:
+    """Build a stable MQTT-safe slug from a German room name.
+
+    Per-room labels come back from the portal as ``RaumTxt`` (e.g. ``Küche``).
+    We ASCII-fold and lowercase so MQTT discovery topics stay stable across
+    HA versions.
+    """
+    folded = (
+        name.lower()
+        .replace("ü", "ue")
+        .replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ß", "ss")
+    )
+    return re.sub(r"[^a-z0-9]+", "_", folded).strip("_")
 
 _OPTIONS_FILE = "/data/options.json"
 _DISCOVERY_NODE = "brunata_fetcher"
@@ -185,14 +193,12 @@ def _extract_advanced_options(options: dict) -> dict:
     mqtt_port = advanced.get("mqtt_port") or options.get("mqtt_port")
     mqtt_user = advanced.get("mqtt_user") or options.get("mqtt_user")
     mqtt_password = advanced.get("mqtt_password") or options.get("mqtt_password")
-    scraper_url = advanced.get("scraper_url") or _DEFAULT_BRUNATA_LOGIN_URL
 
     return {
         "mqtt_host": mqtt_host,
         "mqtt_port": mqtt_port,
         "mqtt_user": mqtt_user,
         "mqtt_password": mqtt_password,
-        "scraper_url": scraper_url,
     }
 
 
@@ -339,13 +345,51 @@ def _normalize_energy_types(
 def _clear_removed_energy_type_entities(
     client: mqtt.Client, selected_energy_types: list[str]
 ) -> None:
-    """Remove HA entities for disabled energy types via retained empty payloads."""
+    """Remove HA entities for disabled energy types via retained empty payloads.
+
+    Also clears the matching ``<slug>_vs_avg`` comparison entity.
+    """
     disabled = set(_ENERGY_TYPES).difference(selected_energy_types)
     for energy_type in disabled:
         slug = energy_type.lower().replace(" ", "_")
-        _publish_mqtt(client, _discovery_topic(slug), "")
-        _publish_mqtt(client, f"brunata_fetcher/sensor/{slug}/state", "")
+        for object_id in (slug, f"{slug}_vs_avg"):
+            _publish_mqtt(client, _discovery_topic(object_id), "")
+            _publish_mqtt(client, f"brunata_fetcher/sensor/{object_id}/state", "")
         _LOGGER.info("Removed disabled energy type entity: %s", energy_type)
+
+
+def _publish_comparison_discovery(client: mqtt.Client, energy_type: str) -> None:
+    """Publish discovery config for the ``<energy_type>_vs_avg`` percentage entity."""
+    slug = energy_type.lower().replace(" ", "_")
+    object_id = f"{slug}_vs_avg"
+    payload = {
+        "name": f"{energy_type} vs. Gebäude",
+        "unique_id": f"brunata_fetcher_{object_id}",
+        "state_topic": f"brunata_fetcher/sensor/{object_id}/state",
+        "unit_of_measurement": "%",
+        "icon": "mdi:home-percent",
+        "suggested_display_precision": 0,
+        "device": _DEVICE_INFO,
+    }
+    _publish_mqtt(client, _discovery_topic(object_id), json.dumps(payload))
+
+
+def _publish_room_discovery(client: mqtt.Client, room_label: str) -> None:
+    """Publish discovery config for a per-room heating kWh entity."""
+    slug = _slug_for_room(room_label)
+    object_id = f"heizung_{slug}"
+    payload = {
+        "name": f"Heizung {room_label}",
+        "unique_id": f"brunata_fetcher_{object_id}",
+        "state_topic": f"brunata_fetcher/sensor/{object_id}/state",
+        "unit_of_measurement": "kWh",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+        "suggested_display_precision": 0,
+        "icon": "mdi:radiator",
+        "device": _DEVICE_INFO,
+    }
+    _publish_mqtt(client, _discovery_topic(object_id), json.dumps(payload))
 
 
 def _publish_discovery(client: mqtt.Client, energy_types: list[str]) -> None:
@@ -373,7 +417,8 @@ def _publish_discovery(client: mqtt.Client, energy_types: list[str]) -> None:
             _discovery_topic(slug),
             json.dumps(payload),
         )
-        _LOGGER.info("Published discovery config for %s", energy_type)
+        _publish_comparison_discovery(client, energy_type)
+        _LOGGER.info("Published discovery config for %s (+ vs_avg)", energy_type)
 
     # Extra sensor: date of last portal update
     _publish_mqtt(
@@ -432,8 +477,19 @@ def _publish_discovery(client: mqtt.Client, energy_types: list[str]) -> None:
     _LOGGER.info("Discovery publish done")
 
 
-def _publish_state(client: mqtt.Client, data: dict, energy_types: list[str]) -> None:
-    """Publish current sensor states."""
+def _publish_state(
+    client: mqtt.Client,
+    data: dict,
+    energy_types: list[str],
+    *,
+    rooms_discovered: set[str],
+) -> None:
+    """Publish current sensor states.
+
+    ``rooms_discovered`` is mutated in place: each room label we see for the
+    first time triggers a one-shot discovery publish. Rooms that vanish from
+    the response don't get cleaned up automatically — they go stale in HA.
+    """
     _LOGGER.info("State publish start")
     for energy_type in energy_types:
         value = data.get(energy_type)
@@ -442,7 +498,38 @@ def _publish_state(client: mqtt.Client, data: dict, energy_types: list[str]) -> 
         slug = energy_type.lower().replace(" ", "_")
         _publish_mqtt(client, f"brunata_fetcher/sensor/{slug}/state", str(value))
         _LOGGER.info("State: %s = %s", energy_type, value)
-        _LOGGER.debug("State topic published: brunata_fetcher/sensor/%s/state", slug)
+
+    comparisons = data.get("comparison_pct") or {}
+    if isinstance(comparisons, dict):
+        for energy_type, pct in comparisons.items():
+            if pct is None:
+                continue
+            slug = energy_type.lower().replace(" ", "_")
+            _publish_mqtt(
+                client,
+                f"brunata_fetcher/sensor/{slug}_vs_avg/state",
+                str(pct),
+            )
+            _LOGGER.info("State: %s vs avg = %s%%", energy_type, pct)
+
+    rooms_kwh = data.get("rooms_kwh") or {}
+    if isinstance(rooms_kwh, dict):
+        for room_label, kwh in rooms_kwh.items():
+            if kwh is None:
+                continue
+            slug = _slug_for_room(room_label)
+            if not slug:
+                continue
+            if room_label not in rooms_discovered:
+                _publish_room_discovery(client, room_label)
+                rooms_discovered.add(room_label)
+                _LOGGER.info("Discovered new room: %s", room_label)
+            _publish_mqtt(
+                client,
+                f"brunata_fetcher/sensor/heizung_{slug}/state",
+                str(kwh),
+            )
+            _LOGGER.info("State: Heizung %s = %s kWh", room_label, kwh)
 
     last_update = data.get("last_update_date")
     if last_update:
@@ -569,36 +656,24 @@ def _send_failure_notification() -> bool:
 # --- Scraper -----------------------------------------------------------------
 
 
-async def _run_scrape(options: dict, scraper_url: str) -> dict | None:
-    """Build scraper config from add-on options and call the scraper."""
+async def _run_fetch(options: dict) -> dict | None:
+    """Build fetcher config from add-on options and call the OData fetcher."""
     start = time.monotonic()
-    _LOGGER.info("Scrape run config build start")
+    advanced = options.get("advanced")
+    debug = bool(advanced.get("debug")) if isinstance(advanced, dict) else False
     config = {
         "email": options["email"],
         "password": options["password"],
         "energy_types": _normalize_energy_types(options.get("energy_types")),
-        "login_url": scraper_url,
-        "selector_email": _SELECTOR_EMAIL,
-        "selector_password": _SELECTOR_PASSWORD,
-        "selector_login_button": _SELECTOR_LOGIN_BUTTON,
-        "selector_date": _SELECTOR_DATE,
-        "selector_value": _SELECTOR_VALUE,
-        "timeout_before_login": 1000,
-        "timeout_after_login": 2000,
-        "timeout_between_clicks": 2000,
-        "playwright_timeout": 30000,
         "headless": True,
-        "energy_type_labels": {k: v["label"] for k, v in _ENERGY_TYPES.items()},
+        "debug": debug,
+        "playwright_timeout": 30000,
     }
-    _LOGGER.info(
-        "Scrape run start: energy_types=%s playwright_timeout_ms=%s",
-        config["energy_types"],
-        config["playwright_timeout"],
-    )
+    _LOGGER.info("Fetch run start: energy_types=%s", config["energy_types"])
     try:
-        result = await scrape(config)
+        result = await _brunata_fetch(config)
         duration = time.monotonic() - start
-        _LOGGER.info("Scrape run succeeded in %.2fs", duration)
+        _LOGGER.info("Fetch run succeeded in %.2fs", duration)
         return result
     except RuntimeError as ex:
         duration = time.monotonic() - start
@@ -608,11 +683,11 @@ async def _run_scrape(options: dict, scraper_url: str) -> dict | None:
                 duration,
             )
         else:
-            _LOGGER.error("Scraping error after %.2fs: %s", duration, ex)
+            _LOGGER.error("Fetch error after %.2fs: %s", duration, ex)
     except Exception as ex:
         duration = time.monotonic() - start
         _LOGGER.exception(
-            "Unexpected error during scraping after %.2fs: %s", duration, ex
+            "Unexpected error during fetch after %.2fs: %s", duration, ex
         )
     return None
 
@@ -651,22 +726,25 @@ async def main() -> None:
     cycle = 0
     failure_notification_sent = False
     portal_query_problem_icon: str | None = None
+    rooms_discovered: set[str] = set()
     while True:
         cycle += 1
         cycle_start = time.monotonic()
         run_started_at = datetime.now(UTC)
-        _LOGGER.info("Cycle %d starting scrape", cycle)
-        data = await _run_scrape(options, advanced["scraper_url"])
+        _LOGGER.info("Cycle %d starting fetch", cycle)
+        data = await _run_fetch(options)
         is_valid_result = False
         if data is not None:
             is_valid_result, invalid_reason = _validate_scrape_result(data, energy_types)
             if not is_valid_result:
                 _LOGGER.warning(
-                    "Cycle %d scrape result failed validation: %s", cycle, invalid_reason
+                    "Cycle %d fetch result failed validation: %s", cycle, invalid_reason
                 )
 
         if data is not None and is_valid_result:
-            _publish_state(mqtt_client, data, energy_types)
+            _publish_state(
+                mqtt_client, data, energy_types, rooms_discovered=rooms_discovered
+            )
             _publish_portal_query_problem_state(mqtt_client, False)
             if portal_query_problem_icon != _PORTAL_QUERY_ICON_OK:
                 _publish_portal_query_problem_discovery(
@@ -674,7 +752,7 @@ async def main() -> None:
                 )
                 portal_query_problem_icon = _PORTAL_QUERY_ICON_OK
             failure_notification_sent = False
-            _LOGGER.info("Cycle %d scrape complete", cycle)
+            _LOGGER.info("Cycle %d fetch complete", cycle)
         else:
             _publish_portal_query_problem_state(mqtt_client, True)
             if portal_query_problem_icon != _PORTAL_QUERY_ICON_PROBLEM:
@@ -686,14 +764,14 @@ async def main() -> None:
                 notification_sent = await asyncio.to_thread(_send_failure_notification)
                 failure_notification_sent = notification_sent
             _LOGGER.warning(
-                "Cycle %d scrape returned no data — will retry after interval", cycle
+                "Cycle %d fetch returned no data — will retry after interval", cycle
             )
 
         cycle_duration = time.monotonic() - cycle_start
         next_run_at = datetime.now(UTC) + timedelta(seconds=scan_interval)
         _publish_schedule_state(mqtt_client, run_started_at, next_run_at)
         _LOGGER.info("Cycle %d finished in %.2fs", cycle, cycle_duration)
-        _LOGGER.info("Next scrape in %d seconds", scan_interval)
+        _LOGGER.info("Next fetch in %d seconds", scan_interval)
         await asyncio.sleep(scan_interval)
 
 

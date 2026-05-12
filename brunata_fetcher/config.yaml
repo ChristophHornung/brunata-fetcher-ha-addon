@@ -1,6 +1,6 @@
 name: "Brunata Fetcher"
-description: "Scrapes the Brunata Nutzerportal and publishes energy sensor data via MQTT Discovery."
-version: "0.2.1"
+description: "Fetches data from the Brunata Nutzerportal and publishes energy sensor data via MQTT Discovery."
+version: "0.3.0"
 slug: "brunata_fetcher"
 url: "https://github.com/MtheK/brunata-fetcher-ha-addon"
 init: false
@@ -26,6 +26,7 @@ options:
     mqtt_user: ""
     mqtt_password: ""
     scraper_url: "https://nutzerportal.brunata-muenchen.de/np_anmeldung/index.html?sap-language=DE"
+    debug: false
 
 schema:
   email: email
@@ -41,3 +42,4 @@ schema:
     mqtt_user: "str?"
     mqtt_password: "password?"
     scraper_url: "url?"
+    debug: "bool?"
