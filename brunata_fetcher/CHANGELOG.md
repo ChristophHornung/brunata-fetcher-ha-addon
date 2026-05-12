@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.6
+
+- More patience for the Brunata login page on slow hardware. Some
+  Pi-class installs were hitting login timeouts even with the 0.3.3
+  bump; the per-action wait is now generous enough that the addon
+  waits rather than fails when SAPUI5 is being especially slow to
+  bootstrap.
+
 ## 0.3.5
 
 - Fixes the historical backfill introduced in 0.3.4: the import call

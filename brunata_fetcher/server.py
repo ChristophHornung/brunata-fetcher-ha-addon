@@ -97,6 +97,12 @@ _PERSISTENT_NOTIFICATION_ID = "brunata_fetcher_portal_query_failed"
 
 _BACKFILL_COMMAND_TOPIC = "brunata_fetcher/cmd/backfill"
 
+# Playwright per-action timeout. Bumped up from the API default because
+# Brunata's SAPUI5 login bootstrap is slow on Pi-class hardware running off
+# an SD card, and we'd rather wait than fail a fetch/backfill that would
+# eventually succeed.
+_PLAYWRIGHT_TIMEOUT_MS = 180_000
+
 
 # --- MQTT helpers ------------------------------------------------------------
 
@@ -687,10 +693,7 @@ async def _run_fetch(options: dict) -> dict | None:
         "energy_types": _normalize_energy_types(options.get("energy_types")),
         "headless": True,
         "debug": debug,
-        # 60 s instead of the API default 30 s. SAPUI5's bootstrap on the
-        # Brunata login page can take longer than 30 s on Pi-class hardware
-        # running off an SD card, especially on a cold-start Chromium.
-        "playwright_timeout": 60000,
+        "playwright_timeout": _PLAYWRIGHT_TIMEOUT_MS,
     }
     _LOGGER.info("Fetch run start: energy_types=%s", config["energy_types"])
     try:
@@ -744,7 +747,7 @@ async def _backfill_watcher(
                     password=options["password"],
                     energy_types=energy_types,
                     headless=True,
-                    playwright_timeout=60000,
+                    playwright_timeout=_PLAYWRIGHT_TIMEOUT_MS,
                 )
                 _LOGGER.info("Backfill: complete")
             except Exception:
