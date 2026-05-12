@@ -684,7 +684,10 @@ async def _run_fetch(options: dict) -> dict | None:
         "energy_types": _normalize_energy_types(options.get("energy_types")),
         "headless": True,
         "debug": debug,
-        "playwright_timeout": 30000,
+        # 60 s instead of the API default 30 s. SAPUI5's bootstrap on the
+        # Brunata login page can take longer than 30 s on Pi-class hardware
+        # running off an SD card, especially on a cold-start Chromium.
+        "playwright_timeout": 60000,
     }
     _LOGGER.info("Fetch run start: energy_types=%s", config["energy_types"])
     try:

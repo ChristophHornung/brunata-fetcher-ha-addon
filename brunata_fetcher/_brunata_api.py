@@ -525,6 +525,16 @@ def _parse_rooms(payload: dict) -> list[dict]:
 async def _login(page, email: str, password: str) -> None:
     _LOGGER.info("Opening login page")
     await page.goto(_LOGIN_URL, wait_until="domcontentloaded")
+    # SAPUI5 bootstraps after DOMContentLoaded and re-renders the form a
+    # couple of times while data binding settles. Wait for network to go
+    # quiet before checking for the email field — without this the
+    # subsequent wait_for_selector can time out on slow hardware even
+    # though the element is briefly visible, because Playwright's
+    # actionability re-check keeps tripping on the re-renders.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        _LOGGER.debug("networkidle wait timed out before login", exc_info=True)
     await page.wait_for_selector(_SEL_EMAIL)
     await page.fill(_SEL_EMAIL, email)
     await page.fill(_SEL_PASSWORD, password)

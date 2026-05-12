@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3
+
+- More reliable login on slower hardware (Raspberry Pi-class with an SD
+  card). Cold-start fetches occasionally timed out before the Brunata
+  portal had finished rendering; the add-on now waits for the page to
+  settle and allows more time for the login step.
+
 ## 0.3.2
 
 - Each room now shows up as its own device in Home Assistant
