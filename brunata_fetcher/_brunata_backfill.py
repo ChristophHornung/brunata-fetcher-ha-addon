@@ -26,8 +26,6 @@ import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
-from urllib import error as urlerror
-from urllib import request as urlrequest
 
 from _brunata_api import (
     _CHROMIUM_ARGS,
@@ -308,52 +306,75 @@ def _all_room_labels(years_data: list[dict]) -> list[str]:
 # --- HA push ----------------------------------------------------------------
 
 
-def _push_statistics(
+_WS_URI = "ws://supervisor/core/api/websocket"
+
+
+async def _ws_auth(ws, supervisor_token: str) -> None:
+    """Walk through HA's auth_required / auth handshake."""
+    msg = json.loads(await ws.recv())
+    if msg.get("type") != "auth_required":
+        raise RuntimeError(f"Expected auth_required from HA, got: {msg}")
+    await ws.send(
+        json.dumps({"type": "auth", "access_token": supervisor_token})
+    )
+    msg = json.loads(await ws.recv())
+    if msg.get("type") != "auth_ok":
+        raise RuntimeError(f"HA WebSocket auth failed: {msg}")
+
+
+async def _push_statistics(
     supervisor_token: str,
     statistic_id: str,
     unit: str,
     name: str,
     stats: list[dict],
+    ws_message_id: int = 1,
 ) -> None:
-    """Call HA's ``recorder.import_statistics`` service via supervisor proxy."""
+    """Push daily stats via HA's recorder/import_statistics WebSocket command.
+
+    HA's recorder uses a WebSocket API for stats imports — it isn't exposed
+    as a regular service call. We talk to it through the Supervisor's
+    WebSocket proxy at ws://supervisor/core/api/websocket using the addon's
+    SUPERVISOR_TOKEN.
+    """
     if not stats:
         _LOGGER.info("No stats to push for %s; skipping", statistic_id)
         return
-    payload = {
-        "statistic_id": statistic_id,
-        "source": "recorder",
-        "name": name,
-        "unit_of_measurement": unit,
+    import websockets
+
+    metadata = {
         "has_mean": False,
         "has_sum": True,
-        "stats": stats,
+        "name": name,
+        "source": "recorder",
+        "statistic_id": statistic_id,
+        "unit_of_measurement": unit,
     }
-    data = json.dumps(payload).encode("utf-8")
-    req = urlrequest.Request(
-        "http://supervisor/core/api/services/recorder/import_statistics",
-        data=data,
-        headers={
-            "Authorization": f"Bearer {supervisor_token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+
     try:
-        with urlrequest.urlopen(req, timeout=60) as response:
-            response.read()
-    except urlerror.HTTPError as ex:
-        body = ""
-        try:
-            body = ex.read().decode("utf-8")
-        except (OSError, UnicodeDecodeError):
-            body = "<unavailable>"
+        async with websockets.connect(_WS_URI, max_size=2**24) as ws:
+            await _ws_auth(ws, supervisor_token)
+            await ws.send(
+                json.dumps(
+                    {
+                        "id": ws_message_id,
+                        "type": "recorder/import_statistics",
+                        "metadata": metadata,
+                        "stats": stats,
+                    }
+                )
+            )
+            result = json.loads(await ws.recv())
+    except Exception as ex:
         raise RuntimeError(
-            f"import_statistics HTTP {ex.code} for {statistic_id}: {body[:300]}"
+            f"recorder/import_statistics websocket call failed for "
+            f"{statistic_id}: {ex}"
         ) from ex
-    except (urlerror.URLError, TimeoutError) as ex:
+
+    if not result.get("success"):
         raise RuntimeError(
-            f"import_statistics network error for {statistic_id}: {ex}"
-        ) from ex
+            f"recorder/import_statistics rejected {statistic_id}: {result}"
+        )
     _LOGGER.info("Imported %d daily stats for %s", len(stats), statistic_id)
 
 
@@ -408,6 +429,7 @@ async def backfill_history(
     cutoff = today.replace(day=1)
     _LOGGER.info("Backfill: cutoff = %s (start of current month)", cutoff)
 
+    ws_id = 1
     # Global per-energy-type sensors.
     for energy_type in energy_types:
         entity_unit = _ENTITY_ID_FOR_ENERGY_TYPE.get(energy_type)
@@ -416,9 +438,15 @@ async def backfill_history(
             continue
         statistic_id, unit = entity_unit
         stats = _stats_for_energy_type(years_data, energy_type, cutoff)
-        _push_statistics(
-            supervisor_token, statistic_id, unit, name=energy_type, stats=stats
+        await _push_statistics(
+            supervisor_token,
+            statistic_id,
+            unit,
+            name=energy_type,
+            stats=stats,
+            ws_message_id=ws_id,
         )
+        ws_id += 1
 
     # Per-room heating sensors. We backfill every room that has ever appeared
     # in the history. If a room currently doesn't exist (renamed, removed),
@@ -432,13 +460,15 @@ async def backfill_history(
                 continue
             statistic_id = f"sensor.brunata_fetcher_heizung_{slug}"
             stats = _stats_for_room(years_data, room_label, cutoff)
-            _push_statistics(
+            await _push_statistics(
                 supervisor_token,
                 statistic_id,
                 "kWh",
                 name=f"Heizung {room_label}",
                 stats=stats,
+                ws_message_id=ws_id,
             )
+            ws_id += 1
 
     duration = time.monotonic() - start
     _LOGGER.info("Backfill: done in %.1fs", duration)

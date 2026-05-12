@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.5
+
+- Fixes the historical backfill introduced in 0.3.4: the import call
+  was using the wrong Home Assistant API and reliably returned HTTP 400.
+  It now uses the WebSocket recorder API correctly, and the backfill
+  completes end-to-end.
+
 ## 0.3.4
 
 - New: historical data backfill. The Brunata portal exposes monthly
