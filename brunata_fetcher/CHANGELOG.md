@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+- Switched the container image to `playwright install chromium-headless-shell`
+  instead of the full `chromium` build. The shell is ~100 MB instead of
+  ~300 MB and `--with-deps` pulls a smaller set of system libs (no X11 /
+  GTK / audio). Estimated image size reduction is ~400–700 MB.
+  `server.py` always launches with `headless=True`, so the full Chromium
+  build was unused weight.
+
 ## 0.3.0
 
 - Replaced Playwright DOM scraping with a cookie-authed OData fetcher

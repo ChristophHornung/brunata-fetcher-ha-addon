@@ -1,19 +1,22 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-# Use Debian base for Playwright stability (glibc-based runtime).
+# Python runtime. The HA base is minimal; install python + pip and drop the
+# apt lists in the same layer so they don't bloat the image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
+    && apt-get install -y --no-install-recommends python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
+# Python deps + the Playwright Chromium headless-shell variant. The shell
+# is ~100 MB instead of ~300 MB for the full Chromium build and `--with-deps`
+# pulls a smaller set of system libs (no X11 / GTK / audio). server.py always
+# launches with headless=True, so the full Chromium build would just be dead
+# weight in the image. Apt lists pulled in by `--with-deps` are cleaned in
+# the same RUN.
 COPY requirements.txt /tmp/requirements.txt
-RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/requirements.txt
-
-# Install Chromium and required system dependencies for Playwright.
-RUN playwright install chromium --with-deps
+RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/requirements.txt \
+    && playwright install chromium-headless-shell --with-deps \
+    && rm -rf /var/lib/apt/lists/* /tmp/requirements.txt
 
 # Copy add-on scripts
 COPY *.py /app/
