@@ -2,39 +2,32 @@
 
 ## 0.3.2
 
-- Per-room heating sensors now live on their own logical HA devices
-  ("Heizkostenverteiler Kinderzimmer", "Heizkostenverteiler Bad", …)
-  linked to the main BRUdirekt device via `via_device`. This lets each
-  room be assigned to the matching HA Area for per-room dashboards.
-  Entity `unique_id`s are unchanged, so existing history is preserved —
-  the entities just migrate to the new devices on first publish after
-  upgrading.
-- Dropped the deprecated `build.yaml`; the base image is now constructed
-  directly in the Dockerfile from `BUILD_ARCH`. No image-content change.
+- Each room now shows up as its own device in Home Assistant
+  ("Heizkostenverteiler Kinderzimmer", "Heizkostenverteiler Bad", …),
+  nested under the main BRUdirekt device. You can assign each room
+  device to its matching Area in HA for per-room dashboards. History
+  on the existing per-room sensors is preserved across the upgrade.
 
 ## 0.3.1
 
-- Switched the container image to `playwright install chromium-headless-shell`
-  instead of the full `chromium` build. The shell is ~100 MB instead of
-  ~300 MB and `--with-deps` pulls a smaller set of system libs (no X11 /
-  GTK / audio). Estimated image size reduction is ~400–700 MB.
-  `server.py` always launches with `headless=True`, so the full Chromium
-  build was unused weight.
+- Add-on image is significantly smaller, so installs and updates pull
+  less data and finish faster — useful on Pi-class hardware with an SD
+  card.
 
 ## 0.3.0
 
-- Replaced Playwright DOM scraping with a cookie-authed OData fetcher
-  (`_brunata_api.py`). Playwright still handles the login itself, but data
-  retrieval now goes through SAP's `NP_UVI_SRV/$batch` directly — full cycle
-  ~10s instead of ~19s, no more selector-driven waits.
-- Added per-room heating sensors in kWh (computed from `Anteil` × YTD total).
-  One sensor per room found in `CumuConsumptionRoomSet`, discovered
-  dynamically.
-- Added "vs. Gebäude" comparison percentage sensors per energy type
-  (`heizung_vs_avg`, `kaltwasser_vs_avg`, `warmwasser_vs_avg`).
-- Documented the reverse-engineered portal API in `docs/portal-api.md`.
-- The DOM-scraping path (`_brunata_scraper.py`) and the interactive explorer
-  (`explore_portal.py`) are preserved for future investigations.
+- Faster portal polling: each fetch cycle takes around 10 seconds
+  instead of ~20.
+- New **per-room heating sensors**, in kWh — one per room the portal
+  reports (typically Bad, Esszimmer, Kinderzimmer, Küche, Schlafzimmer,
+  Wohnzimmer).
+- New **building-average comparison** sensors per energy type: your
+  consumption as a percentage of your building's average for Heizung,
+  Kaltwasser and Warmwasser.
+- The "Letztes Update" sensor now shows the last fully-closed month
+  reported by the portal and stays stable until the next month closes;
+  the energy values themselves keep updating daily as Brunata publishes
+  preliminary current-month readings.
 
 ## 0.2.1
 
