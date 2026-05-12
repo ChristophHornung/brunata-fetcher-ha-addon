@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.7
+
+- Historical backfill now respects entity renames. If you've renamed
+  any of the Brunata sensors in Home Assistant (e.g. a per-room
+  heating sensor to match your own room name), the backfill will
+  write the historical statistics to the renamed entity instead of
+  the original one. Re-run the backfill after upgrading to land the
+  history on the right entity.
+
 ## 0.3.6
 
 - More patience for the Brunata login page on slow hardware. Some

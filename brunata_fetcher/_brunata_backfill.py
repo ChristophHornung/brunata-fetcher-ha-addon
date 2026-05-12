@@ -322,6 +322,54 @@ async def _ws_auth(ws, supervisor_token: str) -> None:
         raise RuntimeError(f"HA WebSocket auth failed: {msg}")
 
 
+async def _fetch_unique_id_to_entity_id(supervisor_token: str) -> dict[str, str]:
+    """Return ``{unique_id: current_entity_id}`` for this addon's entities.
+
+    The MQTT Discovery payloads carry stable ``unique_id`` values
+    (``brunata_fetcher_heizung_kinderzimmer`` etc.), but the user may have
+    renamed the entity_id in HA's UI afterwards. Statistics need to be
+    imported under the **current** entity_id so the renamed live entity owns
+    its history. We query HA's entity registry via the WebSocket API and
+    build the unique_id → entity_id map for our addon's entries.
+    """
+    import websockets
+
+    async with websockets.connect(_WS_URI, max_size=2**24) as ws:
+        await _ws_auth(ws, supervisor_token)
+        await ws.send(
+            json.dumps({"id": 1, "type": "config/entity_registry/list"})
+        )
+        msg = json.loads(await ws.recv())
+
+    if not msg.get("success"):
+        raise RuntimeError(f"entity_registry/list failed: {msg}")
+    mapping: dict[str, str] = {}
+    for entry in msg.get("result", []):
+        unique_id = entry.get("unique_id") or ""
+        entity_id = entry.get("entity_id") or ""
+        if unique_id.startswith("brunata_fetcher_") and entity_id:
+            mapping[unique_id] = entity_id
+    return mapping
+
+
+def _resolve_statistic_id(
+    unique_id_map: dict[str, str], unique_id: str, fallback: str
+) -> str:
+    """Look up the current entity_id for ``unique_id``; fall back if missing.
+
+    Falls back to the original sensor.brunata_fetcher_… name so a missing
+    registry entry (e.g. entity disabled in HA) doesn't break the backfill.
+    """
+    resolved = unique_id_map.get(unique_id)
+    if resolved and resolved != fallback:
+        _LOGGER.info(
+            "Backfill: resolved %s -> %s via entity_registry (renamed)",
+            unique_id,
+            resolved,
+        )
+    return resolved or fallback
+
+
 async def _push_statistics(
     supervisor_token: str,
     statistic_id: str,
@@ -423,6 +471,24 @@ async def backfill_history(
         finally:
             await browser.close()
 
+    # Resolve unique_id -> current entity_id from HA's entity registry, so
+    # we import stats to renamed entities under their new name. Live-polling
+    # already respects renames because MQTT tracks unique_id; backfill needs
+    # to do the same lookup explicitly.
+    try:
+        unique_id_map = await _fetch_unique_id_to_entity_id(supervisor_token)
+        _LOGGER.info(
+            "Backfill: entity registry resolved %d brunata_fetcher entries",
+            len(unique_id_map),
+        )
+    except Exception as ex:
+        _LOGGER.warning(
+            "Backfill: entity_registry lookup failed (%s); "
+            "falling back to default entity_ids",
+            ex,
+        )
+        unique_id_map = {}
+
     # The live-polling path owns the current calendar month. Cut backfill at
     # the first day of it so we don't overwrite the addon's real daily samples.
     today = date.today()
@@ -436,7 +502,11 @@ async def backfill_history(
         if entity_unit is None:
             _LOGGER.warning("Unknown energy_type for backfill: %s", energy_type)
             continue
-        statistic_id, unit = entity_unit
+        default_statistic_id, unit = entity_unit
+        unique_id = default_statistic_id.removeprefix("sensor.")
+        statistic_id = _resolve_statistic_id(
+            unique_id_map, unique_id, default_statistic_id
+        )
         stats = _stats_for_energy_type(years_data, energy_type, cutoff)
         await _push_statistics(
             supervisor_token,
@@ -458,7 +528,11 @@ async def backfill_history(
             slug = _slug_for_room(room_label)
             if not slug:
                 continue
-            statistic_id = f"sensor.brunata_fetcher_heizung_{slug}"
+            unique_id = f"brunata_fetcher_heizung_{slug}"
+            default_statistic_id = f"sensor.brunata_fetcher_heizung_{slug}"
+            statistic_id = _resolve_statistic_id(
+                unique_id_map, unique_id, default_statistic_id
+            )
             stats = _stats_for_room(years_data, room_label, cutoff)
             await _push_statistics(
                 supervisor_token,
