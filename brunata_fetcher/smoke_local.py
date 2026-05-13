@@ -79,6 +79,7 @@ def _assert_discovery_and_state() -> None:
         client,
         {
             "Heizung": 2150.0,
+            "Heizung_witterungsbereinigt": 1980.0,
             "Kaltwasser": 12.5,
             "last_update_date": "28.02.2026",
             "comparison_pct": {
@@ -88,6 +89,10 @@ def _assert_discovery_and_state() -> None:
             "rooms_kwh": {
                 "Kinderzimmer": 691.0,
                 "Küche": 94.0,
+            },
+            "rooms_kwh_witterungsbereinigt": {
+                "Kinderzimmer": 636.6,
+                "Küche": 86.6,
             },
             "rooms_pct": {
                 "Kinderzimmer": 32.15,
@@ -108,6 +113,7 @@ def _assert_discovery_and_state() -> None:
     expected_topics = {
         "homeassistant/sensor/brunata_fetcher/heizung/config",
         "homeassistant/sensor/brunata_fetcher/heizung_vs_avg/config",
+        "homeassistant/sensor/brunata_fetcher/heizung_wb/config",
         "homeassistant/sensor/brunata_fetcher/kaltwasser/config",
         "homeassistant/sensor/brunata_fetcher/kaltwasser_vs_avg/config",
         "homeassistant/sensor/brunata_fetcher/warmwasser/config",
@@ -116,9 +122,12 @@ def _assert_discovery_and_state() -> None:
         "homeassistant/sensor/brunata_fetcher/next_portal_query/config",
         "homeassistant/binary_sensor/brunata_fetcher/portal_query_problem/config",
         "homeassistant/sensor/brunata_fetcher/heizung_kinderzimmer/config",
+        "homeassistant/sensor/brunata_fetcher/heizung_kinderzimmer_wb/config",
         "homeassistant/sensor/brunata_fetcher/heizung_kueche/config",
+        "homeassistant/sensor/brunata_fetcher/heizung_kueche_wb/config",
         "brunata_fetcher/sensor/heizung/state",
         "brunata_fetcher/sensor/heizung_vs_avg/state",
+        "brunata_fetcher/sensor/heizung_wb/state",
         "brunata_fetcher/sensor/kaltwasser/state",
         "brunata_fetcher/sensor/kaltwasser_vs_avg/state",
         "brunata_fetcher/sensor/last_update/state",
@@ -126,7 +135,9 @@ def _assert_discovery_and_state() -> None:
         "brunata_fetcher/sensor/next_portal_query/state",
         "brunata_fetcher/binary_sensor/portal_query_problem/state",
         "brunata_fetcher/sensor/heizung_kinderzimmer/state",
+        "brunata_fetcher/sensor/heizung_kinderzimmer_wb/state",
         "brunata_fetcher/sensor/heizung_kueche/state",
+        "brunata_fetcher/sensor/heizung_kueche_wb/state",
     }
 
     missing = expected_topics - set(topics)

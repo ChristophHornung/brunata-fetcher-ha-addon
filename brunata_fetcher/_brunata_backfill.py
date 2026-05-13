@@ -109,7 +109,8 @@ async def _fetch_history(
     results: list[dict] = []
     for year_info in years:
         year = int(year_info["abdatum"][:4])
-        bisdatum = year_info["bisdatum"]
+        unbumped_bisdatum = year_info["bisdatum"]
+        bisdatum = unbumped_bisdatum
         # For the current year, override Bisdatum from "last completed month-end"
         # to "end of current month" so the API also returns the preliminary
         # in-progress month. This is the same trick the live fetch uses, and
@@ -123,6 +124,10 @@ async def _fetch_history(
                 month_end = date(today.year, today.month + 1, 1) - timedelta(days=1)
             bisdatum = month_end.isoformat()
         bis_literal = f"datetime'{bisdatum}T00:00:00'"
+        # Weather-adjusted queries don't accept the bumped Bis — the portal
+        # only computes WB across closed months, so we keep the original
+        # DatesSet-published Bisdatum for those.
+        wb_bis_literal = f"datetime'{unbumped_bisdatum}T00:00:00'"
 
         inner_gets: list[str] = []
         index_map: list[tuple[str, str]] = []
@@ -146,6 +151,26 @@ async def _fetch_history(
             )
             index_map.append(("monthly", energy_type))
 
+        # Weather-adjusted Heizung — separate stream of history that powers
+        # the "Heizung (witterungsbereinigt)" sensors. Uses the unbumped Bis
+        # because WB only exists for closed months.
+        if "Heizung" in energy_types:
+            kotyp, in_kwh = _ENERGY_TYPE_KOTYP["Heizung"]
+            in_kwh_lit = "true" if in_kwh else "false"
+            inner_gets.append(
+                _build_uvi_inner_get(
+                    "CumuConsumptionMonSet",
+                    [
+                        f"Nutzein eq '{nutzein}'",
+                        f"Bis eq {wb_bis_literal}",
+                        f"Kotyp eq '{kotyp}'",
+                        f"InKwh eq {in_kwh_lit}",
+                        "IsWeatherAdjusted eq true",
+                    ],
+                )
+            )
+            index_map.append(("monthly_wb", "Heizung"))
+
         inner_gets.append(
             _build_uvi_inner_get(
                 "CumuConsumptionRoomSet",
@@ -166,6 +191,7 @@ async def _fetch_history(
             "year": year,
             "bisdatum": bisdatum,
             "monthly": {},
+            "monthly_wb": {},
             "rooms": [],
         }
         for (kind, energy_type), payload in zip(index_map, payloads):
@@ -177,6 +203,14 @@ async def _fetch_history(
                     if datum and verbrauch is not None:
                         monthly_rows.append((datum, verbrauch))
                 year_data["monthly"][energy_type] = sorted(monthly_rows)
+            elif kind == "monthly_wb":
+                wb_rows: list[tuple[str, float]] = []
+                for row in _results(payload):
+                    datum = _parse_sap_date(row.get("Datum"))
+                    verbrauch = _to_float(row.get("Verbrauch"))
+                    if datum and verbrauch is not None:
+                        wb_rows.append((datum, verbrauch))
+                year_data["monthly_wb"][energy_type] = sorted(wb_rows)
             elif kind == "rooms":
                 for row in _results(payload):
                     raum = str(row.get("Raum") or "").strip()
@@ -266,13 +300,22 @@ def _emit_daily_stats(
 
 
 def _stats_for_energy_type(
-    years_data: list[dict], energy_type: str, cutoff: date | None
+    years_data: list[dict],
+    energy_type: str,
+    cutoff: date | None,
+    *,
+    monthly_key: str = "monthly",
 ) -> list[dict]:
-    """Build the full daily-stats list across all years for one cost type."""
+    """Build the full daily-stats list across all years for one cost type.
+
+    ``monthly_key`` selects the per-year data source: ``"monthly"`` for the
+    raw consumption (default), ``"monthly_wb"`` for the weather-adjusted
+    Heizung stream.
+    """
     all_stats: list[dict] = []
     running_sum = 0.0
     for year_data in years_data:
-        monthly_rows = year_data["monthly"].get(energy_type, [])
+        monthly_rows = year_data.get(monthly_key, {}).get(energy_type, [])
         if not monthly_rows:
             continue
         year_stats, running_sum = _emit_daily_stats(
@@ -286,9 +329,19 @@ def _stats_for_energy_type(
 
 
 def _stats_for_room(
-    years_data: list[dict], room_label: str, cutoff: date | None
+    years_data: list[dict],
+    room_label: str,
+    cutoff: date | None,
+    *,
+    monthly_key: str = "monthly",
 ) -> list[dict]:
-    """Per-room heating daily stats: (Anteil/100) × monthly heating spread daily."""
+    """Per-room heating daily stats: (Anteil/100) × monthly heating spread daily.
+
+    ``monthly_key`` selects the heating source month series. Use the default
+    for raw heating, ``"monthly_wb"`` for the weather-adjusted variant — the
+    per-room percentages are identical either way; only the heating total
+    that gets scaled differs.
+    """
     all_stats: list[dict] = []
     running_sum = 0.0
     for year_data in years_data:
@@ -301,7 +354,7 @@ def _stats_for_room(
                 break
         if anteil is None:
             continue
-        monthly_rows = year_data["monthly"].get("Heizung", [])
+        monthly_rows = year_data.get(monthly_key, {}).get("Heizung", [])
         if not monthly_rows:
             continue
         # Scale each month's heating value by the room's share.
@@ -662,6 +715,24 @@ async def backfill_history(
             )
         )
 
+    # Weather-adjusted Heizung total (one extra entity on the BRUdirekt device).
+    if "Heizung" in energy_types:
+        unique_id = "brunata_fetcher_heizung_wb"
+        default_statistic_id = "sensor.brunata_fetcher_heizung_wb"
+        statistic_id = _resolve_statistic_id(
+            unique_id_map, unique_id, default_statistic_id
+        )
+        plan.append(
+            (
+                statistic_id,
+                "kWh",
+                "Heizung (witterungsbereinigt)",
+                _stats_for_energy_type(
+                    years_data, "Heizung", cutoff, monthly_key="monthly_wb"
+                ),
+            )
+        )
+
     if "Heizung" in energy_types:
         for room_label in _all_room_labels(years_data):
             slug = _slug_for_room(room_label)
@@ -678,6 +749,28 @@ async def backfill_history(
                     "kWh",
                     f"Heizung {room_label}",
                     _stats_for_room(years_data, room_label, cutoff),
+                )
+            )
+
+    # Weather-adjusted per-room heating (one extra entity per Heizkostenverteiler).
+    if "Heizung" in energy_types:
+        for room_label in _all_room_labels(years_data):
+            slug = _slug_for_room(room_label)
+            if not slug:
+                continue
+            unique_id = f"brunata_fetcher_heizung_{slug}_wb"
+            default_statistic_id = f"sensor.brunata_fetcher_heizung_{slug}_wb"
+            statistic_id = _resolve_statistic_id(
+                unique_id_map, unique_id, default_statistic_id
+            )
+            plan.append(
+                (
+                    statistic_id,
+                    "kWh",
+                    f"Heizung {room_label} (witterungsbereinigt)",
+                    _stats_for_room(
+                        years_data, room_label, cutoff, monthly_key="monthly_wb"
+                    ),
                 )
             )
 

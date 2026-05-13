@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.11
+
+- New weather-adjusted heating sensors. For every Heizung entity
+  (the main total and each per-room sensor) there's now a
+  "(witterungsbereinigt)" companion that normalises out year-over-year
+  weather differences, so a cold January and a mild January compare
+  meaningfully. The backfill also writes the full historical record
+  for these new sensors. Because Brunata only computes weather
+  adjustment for fully-closed months, the weather-adjusted variant
+  always lags the raw one by up to a month — that's the portal's
+  behaviour, not an addon bug.
+
 ## 0.3.10
 
 - Backfill now auto-fixes the seam between historical and live data. The

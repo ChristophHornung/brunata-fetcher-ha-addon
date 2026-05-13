@@ -356,12 +356,16 @@ def _clear_removed_energy_type_entities(
 ) -> None:
     """Remove HA entities for disabled energy types via retained empty payloads.
 
-    Also clears the matching ``<slug>_vs_avg`` comparison entity.
+    Also clears the matching ``<slug>_vs_avg`` comparison entity and the
+    ``heizung_wb`` weather-adjusted variant when Heizung itself is disabled.
     """
     disabled = set(_ENERGY_TYPES).difference(selected_energy_types)
     for energy_type in disabled:
         slug = energy_type.lower().replace(" ", "_")
-        for object_id in (slug, f"{slug}_vs_avg"):
+        object_ids = [slug, f"{slug}_vs_avg"]
+        if energy_type == "Heizung":
+            object_ids.append("heizung_wb")
+        for object_id in object_ids:
             _publish_mqtt(client, _discovery_topic(object_id), "")
             _publish_mqtt(client, f"brunata_fetcher/sensor/{object_id}/state", "")
         _LOGGER.info("Removed disabled energy type entity: %s", energy_type)
@@ -418,6 +422,24 @@ def _publish_room_discovery(client: mqtt.Client, room_label: str) -> None:
     _publish_mqtt(client, _discovery_topic(object_id), json.dumps(payload))
 
 
+def _publish_room_wb_discovery(client: mqtt.Client, room_label: str) -> None:
+    """Publish discovery for the per-room weather-adjusted Heizung entity."""
+    slug = _slug_for_room(room_label)
+    object_id = f"heizung_{slug}_wb"
+    payload = {
+        "name": "Heizung (witterungsbereinigt)",
+        "unique_id": f"brunata_fetcher_heizung_{slug}_wb",
+        "state_topic": f"brunata_fetcher/sensor/{object_id}/state",
+        "unit_of_measurement": "kWh",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+        "suggested_display_precision": 0,
+        "icon": "mdi:radiator-disabled",
+        "device": _room_device_info(room_label, slug),
+    }
+    _publish_mqtt(client, _discovery_topic(object_id), json.dumps(payload))
+
+
 def _publish_discovery(client: mqtt.Client, energy_types: list[str]) -> None:
     """Publish retained MQTT Discovery config messages for all sensors."""
     _LOGGER.info("Discovery publish start: %d energy types", len(energy_types))
@@ -445,6 +467,27 @@ def _publish_discovery(client: mqtt.Client, energy_types: list[str]) -> None:
         )
         _publish_comparison_discovery(client, energy_type)
         _LOGGER.info("Published discovery config for %s (+ vs_avg)", energy_type)
+
+    # Heating-only: weather-adjusted variant of the main YTD total.
+    if "Heizung" in energy_types:
+        _publish_mqtt(
+            client,
+            _discovery_topic("heizung_wb"),
+            json.dumps(
+                {
+                    "name": "Heizung (witterungsbereinigt)",
+                    "unique_id": "brunata_fetcher_heizung_wb",
+                    "state_topic": "brunata_fetcher/sensor/heizung_wb/state",
+                    "unit_of_measurement": "kWh",
+                    "device_class": "energy",
+                    "state_class": "total_increasing",
+                    "suggested_display_precision": 0,
+                    "icon": "mdi:radiator-disabled",
+                    "device": _DEVICE_INFO,
+                }
+            ),
+        )
+        _LOGGER.info("Published discovery config for Heizung (witterungsbereinigt)")
 
     # Extra sensor: date of last portal update
     _publish_mqtt(
@@ -513,8 +556,9 @@ def _publish_state(
     """Publish current sensor states.
 
     ``rooms_discovered`` is mutated in place: each room label we see for the
-    first time triggers a one-shot discovery publish. Rooms that vanish from
-    the response don't get cleaned up automatically — they go stale in HA.
+    first time triggers a one-shot discovery publish (for both the raw and
+    weather-adjusted Heizung entities). Rooms that vanish from the response
+    don't get cleaned up automatically — they go stale in HA.
     """
     _LOGGER.info("State publish start")
     for energy_type in energy_types:
@@ -524,6 +568,14 @@ def _publish_state(
         slug = energy_type.lower().replace(" ", "_")
         _publish_mqtt(client, f"brunata_fetcher/sensor/{slug}/state", str(value))
         _LOGGER.info("State: %s = %s", energy_type, value)
+
+    # Weather-adjusted Heizung total
+    wb_total = data.get("Heizung_witterungsbereinigt")
+    if wb_total is not None:
+        _publish_mqtt(
+            client, "brunata_fetcher/sensor/heizung_wb/state", str(wb_total)
+        )
+        _LOGGER.info("State: Heizung (witterungsbereinigt) = %s", wb_total)
 
     comparisons = data.get("comparison_pct") or {}
     if isinstance(comparisons, dict):
@@ -539,6 +591,7 @@ def _publish_state(
             _LOGGER.info("State: %s vs avg = %s%%", energy_type, pct)
 
     rooms_kwh = data.get("rooms_kwh") or {}
+    rooms_kwh_wb = data.get("rooms_kwh_witterungsbereinigt") or {}
     if isinstance(rooms_kwh, dict):
         for room_label, kwh in rooms_kwh.items():
             if kwh is None:
@@ -548,6 +601,7 @@ def _publish_state(
                 continue
             if room_label not in rooms_discovered:
                 _publish_room_discovery(client, room_label)
+                _publish_room_wb_discovery(client, room_label)
                 rooms_discovered.add(room_label)
                 _LOGGER.info("Discovered new room: %s", room_label)
             _publish_mqtt(
@@ -556,6 +610,18 @@ def _publish_state(
                 str(kwh),
             )
             _LOGGER.info("State: Heizung %s = %s kWh", room_label, kwh)
+            wb_kwh = rooms_kwh_wb.get(room_label)
+            if wb_kwh is not None:
+                _publish_mqtt(
+                    client,
+                    f"brunata_fetcher/sensor/heizung_{slug}_wb/state",
+                    str(wb_kwh),
+                )
+                _LOGGER.info(
+                    "State: Heizung %s (witterungsbereinigt) = %s kWh",
+                    room_label,
+                    wb_kwh,
+                )
 
     last_update = data.get("last_update_date")
     if last_update:

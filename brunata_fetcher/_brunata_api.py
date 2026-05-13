@@ -660,6 +660,33 @@ async def _fetch_all(request, energy_types: list[str]) -> dict:
         )
         index_map.append(("comparison", energy_type))
 
+    # Weather-adjusted Heizung — same monthly set, IsWeatherAdjusted=true.
+    # We only do it for Heizung since heating is the only cost type where
+    # seasonality matters; cold/warm water consumption isn't weather-driven.
+    #
+    # Important: the WB query MUST use the unbumped Bisdatum (i.e. the last
+    # completed month-end as published by DatesSet) — querying with the
+    # bumped current-month-end returns 0 rows. The portal only computes
+    # weather adjustment over fully-closed months. Consequence: in the
+    # in-progress month the WB sensor lags the raw one by up to ~30 days.
+    if "Heizung" in energy_types:
+        kotyp, in_kwh = _ENERGY_TYPE_KOTYP["Heizung"]
+        in_kwh_lit = "true" if in_kwh else "false"
+        wb_bis_literal = f"datetime'{official_last_update_iso}T00:00:00'"
+        inner_gets.append(
+            _build_uvi_inner_get(
+                "CumuConsumptionMonSet",
+                [
+                    f"Nutzein eq '{nutzein}'",
+                    f"Bis eq {wb_bis_literal}",
+                    f"Kotyp eq '{kotyp}'",
+                    f"InKwh eq {in_kwh_lit}",
+                    "IsWeatherAdjusted eq true",
+                ],
+            )
+        )
+        index_map.append(("monthly_wb", "Heizung"))
+
     inner_gets.append(_build_uvi_inner_get("CumuConsumptionRoomSet", common))
     index_map.append(("rooms", ""))
 
@@ -682,6 +709,7 @@ async def _fetch_all(request, energy_types: list[str]) -> dict:
         "comparison_pct": {},
     }
     heating_total_kwh: float | None = None
+    heating_wb_total_kwh: float | None = None
     rooms_payload: dict | None = None
 
     for (kind, energy_type), payload in zip(index_map, payloads):
@@ -690,6 +718,10 @@ async def _fetch_all(request, energy_types: list[str]) -> dict:
             out[energy_type] = total
             if energy_type == "Heizung":
                 heating_total_kwh = total
+        elif kind == "monthly_wb":
+            total, _row_date = _parse_monthly(payload)
+            out["Heizung_witterungsbereinigt"] = total
+            heating_wb_total_kwh = total
         elif kind == "comparison":
             out["comparison_pct"][energy_type] = _parse_comparison(payload)
         elif kind == "rooms":
@@ -697,6 +729,7 @@ async def _fetch_all(request, energy_types: list[str]) -> dict:
 
     rooms_pct: dict[str, float] = {}
     rooms_kwh: dict[str, float] = {}
+    rooms_kwh_wb: dict[str, float] = {}
     if rooms_payload is not None:
         for room in _parse_rooms(rooms_payload):
             label = room["RaumTxt"]
@@ -704,8 +737,13 @@ async def _fetch_all(request, energy_types: list[str]) -> dict:
             rooms_pct[label] = round(anteil, 2)
             if heating_total_kwh is not None:
                 rooms_kwh[label] = round(anteil / 100 * heating_total_kwh, 1)
+            if heating_wb_total_kwh is not None:
+                rooms_kwh_wb[label] = round(
+                    anteil / 100 * heating_wb_total_kwh, 1
+                )
     out["rooms_pct"] = rooms_pct
     out["rooms_kwh"] = rooms_kwh
+    out["rooms_kwh_witterungsbereinigt"] = rooms_kwh_wb
 
     return out
 
