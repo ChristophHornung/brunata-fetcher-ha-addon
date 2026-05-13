@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.12
+
+- Backfill's automatic seam-fix now actually catches the dip. In 0.3.10
+  the fix ran 6 minutes after the backfill, which sometimes missed
+  Home Assistant's hourly statistics compile — meaning the negative bar
+  could still reappear in the Energy Dashboard. The fix now waits until
+  just after the next full UTC hour (when HA writes its compiled values)
+  and retries hourly for up to three hours if the live data hasn't
+  arrived yet. Re-run the backfill after upgrading to clear any
+  remaining dip.
+
 ## 0.3.11
 
 - New weather-adjusted heating sensors. For every Heizung entity

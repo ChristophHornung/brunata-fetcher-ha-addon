@@ -819,16 +819,15 @@ async def backfill_history(
 
     # Spawn the seam-bridge task in the background. We can't bridge synchronously
     # because HA hasn't yet generated the bad sum=0 rows — that happens after
-    # the next compile cycle (within ~5 min).
+    # the next hourly compile fires.
     if expected_anchors:
         asyncio.create_task(
             _bridge_seam_after_delay(
-                supervisor_token, expected_anchors, seam_iso, delay_s=360
+                supervisor_token, expected_anchors, seam_iso
             )
         )
         _LOGGER.info(
-            "Backfill: seam-bridge task scheduled in %d s for %d entities",
-            360,
+            "Backfill: seam-bridge task scheduled for %d entities",
             len(expected_anchors),
         )
 
@@ -838,63 +837,110 @@ async def _bridge_seam_after_delay(
     expected_anchors: dict[str, tuple[float, float, str]],
     seam_iso: str,
     *,
-    delay_s: int = 360,
+    max_attempts: int = 3,
+    retry_interval_s: int = 3600,
 ) -> None:
-    """Wait for HA's compile to produce live stats, then bridge the seam.
+    """Wait for HA's hourly compile to fire, then bridge the seam.
 
     HA's compile uses ``statistics_short_term`` (which we cleared) as the
-    baseline source for new entries. Without a fresh baseline, every new
+    baseline for new long-term rows. Without a fresh baseline, every new
     short-term row gets ``sum=0`` and that propagates into hourly long-term
     rows too. We can't seed short-term ourselves (no public API), but we
-    can wait for HA to produce a few rows and then apply
+    can wait for HA to produce rows and then apply
     ``adjust_sum_statistics`` to shift them up to the correct sum.
 
-    The adjustment we want equals ``expected_sum - actual_sum`` for any row
-    after ``seam_iso``. We pick the latest short-term row in that window,
-    read its ``sum``, and use ``expected_sum - that_sum`` as the adjustment.
+    Timing matters: HA's long-term compile fires on each UTC hour boundary,
+    so we wait until ``next-hour-boundary + 5 min`` for the first attempt,
+    ensuring at least one bad hourly row exists to be corrected. If a given
+    entity still has no live stats (e.g. live polling hasn't fetched yet),
+    we retry up to ``max_attempts`` times spaced ``retry_interval_s`` apart.
+
     Idempotent: re-running with already-corrected data computes
     ``adjustment ≈ 0`` and we skip.
     """
-    _LOGGER.info("Bridge: sleeping %d s before reconciling seam", delay_s)
-    await asyncio.sleep(delay_s)
+    now = datetime.now(timezone.utc)
+    next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    first_wake = next_hour + timedelta(minutes=5)
+    # Minimum 6 minutes so a backfill triggered seconds before a UTC hour
+    # boundary still gives HA's compile time to actually run.
+    initial_delay = max((first_wake - now).total_seconds(), 360.0)
+    _LOGGER.info(
+        "Bridge: sleeping %.0f s (until %s) for HA's first hourly compile after seam",
+        initial_delay,
+        first_wake.isoformat(),
+    )
+    await asyncio.sleep(initial_delay)
 
-    for statistic_id, (expected_state, expected_sum, unit) in expected_anchors.items():
-        try:
-            latest = await _query_statistics_during_period(
-                supervisor_token, statistic_id, seam_iso
-            )
-        except Exception as ex:
-            _LOGGER.warning(
-                "Bridge: query failed for %s (%s); skipping", statistic_id, ex
-            )
-            continue
-        if latest is None:
+    pending: dict[str, tuple[float, float, str]] = dict(expected_anchors)
+    for attempt in range(1, max_attempts + 1):
+        if not pending:
+            break
+        _LOGGER.info(
+            "Bridge: attempt %d/%d for %d entities",
+            attempt,
+            max_attempts,
+            len(pending),
+        )
+        still_pending: dict[str, tuple[float, float, str]] = {}
+        for statistic_id, (expected_state, expected_sum, unit) in pending.items():
+            try:
+                latest = await _query_statistics_during_period(
+                    supervisor_token, statistic_id, seam_iso
+                )
+            except Exception as ex:
+                _LOGGER.warning(
+                    "Bridge: query failed for %s (%s); will retry",
+                    statistic_id,
+                    ex,
+                )
+                still_pending[statistic_id] = (expected_state, expected_sum, unit)
+                continue
+            if latest is None:
+                _LOGGER.info(
+                    "Bridge: no live stats yet for %s; will retry", statistic_id
+                )
+                still_pending[statistic_id] = (expected_state, expected_sum, unit)
+                continue
+            actual_sum = float(latest.get("sum", 0) or 0)
+            actual_state = float(latest.get("state", 0) or 0)
+            target_sum = expected_sum + max(0.0, actual_state - expected_state)
+            adjustment = target_sum - actual_sum
+            if abs(adjustment) < 0.5:
+                _LOGGER.info(
+                    "Bridge: %s already chained (sum=%.1f, target=%.1f); done",
+                    statistic_id,
+                    actual_sum,
+                    target_sum,
+                )
+                continue
+            try:
+                await _adjust_sum_statistics(
+                    supervisor_token,
+                    statistic_id,
+                    start_time_iso=seam_iso,
+                    adjustment=adjustment,
+                    unit_of_measurement=unit,
+                )
+            except Exception as ex:
+                _LOGGER.warning(
+                    "Bridge: adjust_sum_statistics failed for %s: %s; will retry",
+                    statistic_id,
+                    ex,
+                )
+                still_pending[statistic_id] = (expected_state, expected_sum, unit)
+        pending = still_pending
+        if pending and attempt < max_attempts:
             _LOGGER.info(
-                "Bridge: no live stats yet for %s; nothing to bridge", statistic_id
+                "Bridge: %d entities still pending; sleeping %d s before retry",
+                len(pending),
+                retry_interval_s,
             )
-            continue
-        actual_sum = float(latest.get("sum", 0) or 0)
-        actual_state = float(latest.get("state", 0) or 0)
-        # The fully-correct sum at the latest live state, given our anchor:
-        target_sum = expected_sum + max(0.0, actual_state - expected_state)
-        adjustment = target_sum - actual_sum
-        if abs(adjustment) < 0.5:
-            _LOGGER.info(
-                "Bridge: %s already chained (sum=%.1f, target=%.1f); skipping",
-                statistic_id,
-                actual_sum,
-                target_sum,
-            )
-            continue
-        try:
-            await _adjust_sum_statistics(
-                supervisor_token,
-                statistic_id,
-                start_time_iso=seam_iso,
-                adjustment=adjustment,
-                unit_of_measurement=unit,
-            )
-        except Exception as ex:
-            _LOGGER.warning(
-                "Bridge: adjust_sum_statistics failed for %s: %s", statistic_id, ex
-            )
+            await asyncio.sleep(retry_interval_s)
+
+    if pending:
+        _LOGGER.warning(
+            "Bridge: gave up on %d entities after %d attempts: %s",
+            len(pending),
+            max_attempts,
+            sorted(pending.keys()),
+        )
