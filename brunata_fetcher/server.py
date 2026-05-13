@@ -21,7 +21,10 @@ from urllib import request as urlrequest
 import paho.mqtt.client as mqtt
 
 from _brunata_api import fetch as _brunata_fetch
-from _brunata_backfill import backfill_history as _brunata_backfill
+from _brunata_backfill import (
+    backfill_history as _brunata_backfill,
+    signal_live_fetch_completed as _signal_live_fetch_completed,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -902,6 +905,10 @@ async def main() -> None:
                 )
                 portal_query_problem_icon = _PORTAL_QUERY_ICON_OK
             failure_notification_sent = False
+            # Let a running seam-bridge task know a fresh state just landed,
+            # so it can adjust against a short-term row that already carries
+            # the latest portal value.
+            _signal_live_fetch_completed()
             _LOGGER.info("Cycle %d fetch complete", cycle)
         else:
             _publish_portal_query_problem_state(mqtt_client, True)

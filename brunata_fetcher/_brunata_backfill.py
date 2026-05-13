@@ -46,6 +46,32 @@ from _brunata_api import (
 _LOGGER = logging.getLogger("brunata_fetcher.backfill")
 
 
+# Signal raised by server.py after every successful live fetch's state publish.
+# The seam-bridge task waits on this so it adjusts against a short-term row
+# that already carries the latest portal value. Without that wait, the bridge
+# can run against ``state=0`` on a fresh install and the next live poll then
+# creates a delta spike equal to the YTD value.
+_LIVE_FETCH_EVENT: asyncio.Event | None = None
+
+
+def _get_live_fetch_event() -> asyncio.Event:
+    """Lazy-create the live-fetch event so module import doesn't need a loop."""
+    global _LIVE_FETCH_EVENT
+    if _LIVE_FETCH_EVENT is None:
+        _LIVE_FETCH_EVENT = asyncio.Event()
+    return _LIVE_FETCH_EVENT
+
+
+def signal_live_fetch_completed() -> None:
+    """Mark that the live fetcher just published a fresh state to MQTT.
+
+    Called by server.py after each successful publish_state cycle. The
+    seam-bridge waits on this signal before adjusting so HA's short-term
+    table has had a chance to ingest the latest portal value.
+    """
+    _get_live_fetch_event().set()
+
+
 # Map energy_type label to the HA entity id we publish via Discovery.
 _ENTITY_ID_FOR_ENERGY_TYPE: dict[str, tuple[str, str]] = {
     "Heizung": ("sensor.brunata_fetcher_heizung", "kWh"),
@@ -819,8 +845,13 @@ async def backfill_history(
 
     # Spawn the seam-bridge task in the background. We can't bridge synchronously
     # because HA hasn't yet generated the bad sum=0 rows — that happens after
-    # the next hourly compile fires.
+    # the next hourly compile fires AND after the next live fetch publishes
+    # a fresh state.
     if expected_anchors:
+        # Reset the event so the bridge specifically waits for a fetch that
+        # happens AFTER this point — any live fetch from before backfill is
+        # irrelevant.
+        _get_live_fetch_event().clear()
         asyncio.create_task(
             _bridge_seam_after_delay(
                 supervisor_token, expected_anchors, seam_iso
@@ -839,8 +870,9 @@ async def _bridge_seam_after_delay(
     *,
     max_attempts: int = 3,
     retry_interval_s: int = 3600,
+    live_fetch_timeout_s: int = 90000,
 ) -> None:
-    """Wait for HA's hourly compile to fire, then bridge the seam.
+    """Wait for HA's hourly compile + a fresh live fetch, then bridge the seam.
 
     HA's compile uses ``statistics_short_term`` (which we cleared) as the
     baseline for new long-term rows. Without a fresh baseline, every new
@@ -849,11 +881,21 @@ async def _bridge_seam_after_delay(
     can wait for HA to produce rows and then apply
     ``adjust_sum_statistics`` to shift them up to the correct sum.
 
-    Timing matters: HA's long-term compile fires on each UTC hour boundary,
-    so we wait until ``next-hour-boundary + 5 min`` for the first attempt,
-    ensuring at least one bad hourly row exists to be corrected. If a given
-    entity still has no live stats (e.g. live polling hasn't fetched yet),
-    we retry up to ``max_attempts`` times spaced ``retry_interval_s`` apart.
+    Two timing constraints matter:
+
+    1. HA's long-term compile fires on each UTC hour boundary, so we wait
+       until ``next-hour-boundary + 5 min`` for the first attempt, ensuring
+       at least one bad hourly row exists to be corrected.
+    2. ``adjust_sum_statistics`` only shifts ``sum``, not ``state``. If the
+       latest short-term row still has the pre-backfill state (or no state
+       at all on a fresh install), the next live fetch will publish a state
+       jump and HA's compile will treat the delta as new consumption,
+       producing a spike on top of our adjustment. So we also wait for the
+       next live fetch to land + a 6-minute compile buffer before adjusting,
+       guaranteeing short-term carries the latest portal value.
+
+    If a given entity still has no live stats after both waits, we retry up
+    to ``max_attempts`` times spaced ``retry_interval_s`` apart.
 
     Idempotent: re-running with already-corrected data computes
     ``adjustment ≈ 0`` and we skip.
@@ -870,6 +912,34 @@ async def _bridge_seam_after_delay(
         first_wake.isoformat(),
     )
     await asyncio.sleep(initial_delay)
+
+    # Wait for the live fetcher to publish a fresh state since the seam, so
+    # short-term carries the latest portal value. Then give HA's 5-minute
+    # compile a 6-minute buffer to ingest that state before we adjust.
+    event = _get_live_fetch_event()
+    if event.is_set():
+        _LOGGER.info(
+            "Bridge: live fetch already happened since seam; proceeding to adjust"
+        )
+    else:
+        _LOGGER.info(
+            "Bridge: waiting up to %d s for the next live fetch before adjusting",
+            live_fetch_timeout_s,
+        )
+        try:
+            await asyncio.wait_for(event.wait(), timeout=live_fetch_timeout_s)
+            _LOGGER.info(
+                "Bridge: live fetch detected; pausing 6 min for HA to compile "
+                "the published state into short-term"
+            )
+            await asyncio.sleep(360)
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Bridge: no live fetch within %d s; proceeding with stale "
+                "short-term — re-trigger the backfill after a live fetch if "
+                "the dashboard still shows a discontinuity",
+                live_fetch_timeout_s,
+            )
 
     pending: dict[str, tuple[float, float, str]] = dict(expected_anchors)
     for attempt in range(1, max_attempts + 1):
