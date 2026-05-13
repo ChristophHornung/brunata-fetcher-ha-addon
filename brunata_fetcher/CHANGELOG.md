@@ -2,15 +2,11 @@
 
 ## 0.3.13
 
-- Backfill's seam-fix now also waits for the next live portal fetch before
-  reconciling, not only for Home Assistant's hourly statistics compile.
-  On a fresh install (no prior live data) the previous version could
-  reconcile against a zero baseline and the first live reading would then
-  show up as a one-off spike on top of the imported history. The fix now
-  waits for both signals — at least one fresh fetch since the backfill,
-  plus a brief settle window for HA to ingest it — before adjusting.
-  Re-run the backfill after upgrading if the dashboard still shows a
-  spike or dip near the seam.
+- Improved backfill reliability. The automatic seam-fix now waits for
+  both Home Assistant's hourly statistics compile and the next live
+  portal fetch before reconciling, so fresh installs no longer show a
+  one-off spike where the imported history meets live data. Re-run the
+  backfill after upgrading if the seam still looks off.
 
 ## 0.3.12
 

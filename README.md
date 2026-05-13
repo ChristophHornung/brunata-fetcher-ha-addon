@@ -12,10 +12,15 @@ Keywords: Brunata München Nutzerportal, BRUdirekt, BRUNATA-METRONA.
 - Energy types `Heizung`, `Kaltwasser`, `Warmwasser`
 - **Per-room heating breakdown** in kWh, derived from the portal's
   `Raumvergleich` distribution × the heating YTD total
+- **Weather-adjusted Heizung companions** (`(witterungsbereinigt)`) for
+  the main total and each per-room sensor, sourced from the portal's
+  own seasonality correction
 - **Building-average comparison** percentage per cost type (your usage as a
   % of the building average)
 - Includes the portal's preliminary in-progress-month value, so the HA
   Energy Dashboard stays current between Brunata's monthly meter reads
+- **One-shot historical backfill** from 2023 into HA's long-term
+  statistics via an MQTT command — see [Historical backfill](#historical-backfill)
 - MQTT Discovery (no manual entity setup)
 - Supervisor MQTT service discovery when manual MQTT settings are empty
 - Portal-health binary sensor (`device_class: problem`) plus a persistent
@@ -63,7 +68,8 @@ longer drives behaviour — the OData endpoints are hard-coded.
 ## Published entities
 
 A default setup (all three energy types, a typical apartment with six
-rooms) gives you 16 entities under the **BRUdirekt** MQTT device.
+rooms) gives you ~23 entities under the **BRUdirekt** MQTT device,
+plus one device per room.
 
 Energy totals (`state_class: total_increasing`, Energy Dashboard ready):
 
@@ -71,12 +77,20 @@ Energy totals (`state_class: total_increasing`, Energy Dashboard ready):
 - `sensor.brunata_fetcher_kaltwasser` — m³
 - `sensor.brunata_fetcher_warmwasser` — kWh
 
+Weather-adjusted heating (kWh, `total_increasing`):
+
+- `sensor.brunata_fetcher_heizung_wb` — Brunata's witterungsbereinigt
+  total. Lags the raw value by up to a month because the portal only
+  computes it for fully-closed months.
+
 Per-room heating (kWh, `total_increasing`, registered dynamically the
 first time each room is seen):
 
 - `sensor.brunata_fetcher_heizung_<room>` — one per room reported by the
   portal (typically Bad, Esszimmer, Kinderzimmer, Küche, Schlafzimmer,
   Wohnzimmer)
+- `sensor.brunata_fetcher_heizung_<room>_wb` — weather-adjusted
+  companion for each room
 
 Building-average comparison (your value as a percentage of the building
 average):
@@ -100,6 +114,32 @@ Metadata + health:
 
 You can rename any entity in HA without breaking the add-on — the
 `unique_id` published over MQTT Discovery is the stable anchor.
+
+## Historical backfill
+
+The portal exposes monthly Verbrauch data back to 2023. The add-on can
+pull all of that into Home Assistant as long-term statistics so the
+Energy Dashboard shows year-over-year comparisons from day one,
+instead of only what's been polled since install. Per-room and
+weather-adjusted history is included.
+
+To trigger it from HA:
+
+1. **Developer Tools → Actions** (formerly "Services").
+2. Action: **`mqtt.publish`**.
+3. Topic: `brunata_fetcher/cmd/backfill`. Payload: leave empty.
+4. **Perform Action**.
+
+The backfill runs once in the background (a couple of minutes). It
+clears each entity's existing statistics first, then imports the full
+history with daily granularity (months are interpolated linearly across
+their days), and finally reconciles the seam between the imported
+history and the live polling stream so the Energy Dashboard doesn't
+render a discontinuity bar where the two meet. The reconciliation
+happens after HA's next hourly statistics compile and the next live
+fetch since the backfill — typically within an hour or two of
+triggering. Re-running the backfill later is safe; existing imported
+data is replaced cleanly.
 
 ## How query success is evaluated
 
