@@ -200,6 +200,19 @@ The unbumped `Bisdatum` from `DatesSet` is still surfaced separately as
 last close a month", which only ticks forward when Brunata processes
 end-of-month readings.
 
+### How often the preliminary value actually updates
+
+Empirically (observed over a multi-day run): Brunata refreshes the
+preliminary current-month `Verbrauch` **once per day**, in the late
+afternoon — in one observed case the new value showed up shortly after
+17:00 local time. Polling more often than once a day returns the same
+preliminary value over and over. The default `scan_interval_hours: 24`
+is therefore already correct; anything shorter mostly wastes Pi CPU /
+SD writes / Brunata's rate limit headroom. If you want to *catch* the
+daily bump tightly, schedule the polling to fire after 18:00 local time;
+otherwise the addon's once-daily cycle on whatever clock alignment it
+landed on is fine.
+
 ## Why we still use Playwright at all
 
 The login itself goes through a SAPUI5 form with anti-CSRF tokens we don't
