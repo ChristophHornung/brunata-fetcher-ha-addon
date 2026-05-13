@@ -434,6 +434,82 @@ def _resolve_statistic_id(
     return resolved or fallback
 
 
+async def _adjust_sum_statistics(
+    supervisor_token: str,
+    statistic_id: str,
+    start_time_iso: str,
+    adjustment: float,
+    unit_of_measurement: str | None,
+) -> None:
+    """Add ``adjustment`` to ``sum`` on all stats from ``start_time_iso`` forward.
+
+    This is the same WebSocket command HA's "Adjust a statistic" UI uses.
+    It walks both ``statistics`` and ``statistics_short_term`` and adds the
+    delta to the ``sum`` column, leaving ``state`` alone. We use it after
+    backfill to bridge the seam between the imported history and the live
+    short-term rows HA generates with ``sum=0`` baseline.
+    """
+    import websockets
+
+    async with websockets.connect(_WS_URI, max_size=2**24) as ws:
+        await _ws_auth(ws, supervisor_token)
+        await ws.send(
+            json.dumps(
+                {
+                    "id": 1,
+                    "type": "recorder/adjust_sum_statistics",
+                    "statistic_id": statistic_id,
+                    "start_time": start_time_iso,
+                    "adjustment": adjustment,
+                    "adjustment_unit_of_measurement": unit_of_measurement,
+                }
+            )
+        )
+        msg = json.loads(await ws.recv())
+    if not msg.get("success"):
+        raise RuntimeError(
+            f"recorder/adjust_sum_statistics rejected {statistic_id}: {msg}"
+        )
+    _LOGGER.info(
+        "Adjusted %s sum by %+.3f %s from %s",
+        statistic_id,
+        adjustment,
+        unit_of_measurement or "",
+        start_time_iso,
+    )
+
+
+async def _query_statistics_during_period(
+    supervisor_token: str, statistic_id: str, start_time_iso: str
+) -> dict | None:
+    """Return the latest stat row's `{state, sum, ...}` since ``start_time_iso``.
+
+    Used to detect whether HA has already chained sum correctly off our
+    backfill (no adjustment needed) or is still stuck at `sum=0` (adjust).
+    """
+    import websockets
+
+    async with websockets.connect(_WS_URI, max_size=2**24) as ws:
+        await _ws_auth(ws, supervisor_token)
+        await ws.send(
+            json.dumps(
+                {
+                    "id": 1,
+                    "type": "recorder/statistics_during_period",
+                    "start_time": start_time_iso,
+                    "statistic_ids": [statistic_id],
+                    "period": "5minute",
+                    "types": ["state", "sum"],
+                }
+            )
+        )
+        msg = json.loads(await ws.recv())
+    if not msg.get("success"):
+        return None
+    rows = (msg.get("result") or {}).get(statistic_id) or []
+    return rows[-1] if rows else None
+
+
 async def _push_statistics(
     supervisor_token: str,
     statistic_id: str,
@@ -618,7 +694,13 @@ async def backfill_history(
             ex,
         )
 
+    # Capture the seam timestamp BEFORE the import — HA will start generating
+    # bad ``sum=0`` short-term rows shortly after this moment, and the bridge
+    # task needs that timestamp as the ``start_time`` for adjust_sum_statistics.
+    seam_iso = datetime.now(timezone.utc).isoformat()
+
     ws_id = 1
+    expected_anchors: dict[str, tuple[float, float, str]] = {}
     for statistic_id, unit, name, stats in plan:
         await _push_statistics(
             supervisor_token,
@@ -629,6 +711,97 @@ async def backfill_history(
             ws_message_id=ws_id,
         )
         ws_id += 1
+        # Track the final imported row's (state, sum) so the bridge task can
+        # compute the right adjustment without re-reading the import.
+        if stats:
+            last = stats[-1]
+            expected_anchors[statistic_id] = (
+                float(last["state"]),
+                float(last["sum"]),
+                unit,
+            )
 
     duration = time.monotonic() - start
     _LOGGER.info("Backfill: done in %.1fs", duration)
+
+    # Spawn the seam-bridge task in the background. We can't bridge synchronously
+    # because HA hasn't yet generated the bad sum=0 rows — that happens after
+    # the next compile cycle (within ~5 min).
+    if expected_anchors:
+        asyncio.create_task(
+            _bridge_seam_after_delay(
+                supervisor_token, expected_anchors, seam_iso, delay_s=360
+            )
+        )
+        _LOGGER.info(
+            "Backfill: seam-bridge task scheduled in %d s for %d entities",
+            360,
+            len(expected_anchors),
+        )
+
+
+async def _bridge_seam_after_delay(
+    supervisor_token: str,
+    expected_anchors: dict[str, tuple[float, float, str]],
+    seam_iso: str,
+    *,
+    delay_s: int = 360,
+) -> None:
+    """Wait for HA's compile to produce live stats, then bridge the seam.
+
+    HA's compile uses ``statistics_short_term`` (which we cleared) as the
+    baseline source for new entries. Without a fresh baseline, every new
+    short-term row gets ``sum=0`` and that propagates into hourly long-term
+    rows too. We can't seed short-term ourselves (no public API), but we
+    can wait for HA to produce a few rows and then apply
+    ``adjust_sum_statistics`` to shift them up to the correct sum.
+
+    The adjustment we want equals ``expected_sum - actual_sum`` for any row
+    after ``seam_iso``. We pick the latest short-term row in that window,
+    read its ``sum``, and use ``expected_sum - that_sum`` as the adjustment.
+    Idempotent: re-running with already-corrected data computes
+    ``adjustment ≈ 0`` and we skip.
+    """
+    _LOGGER.info("Bridge: sleeping %d s before reconciling seam", delay_s)
+    await asyncio.sleep(delay_s)
+
+    for statistic_id, (expected_state, expected_sum, unit) in expected_anchors.items():
+        try:
+            latest = await _query_statistics_during_period(
+                supervisor_token, statistic_id, seam_iso
+            )
+        except Exception as ex:
+            _LOGGER.warning(
+                "Bridge: query failed for %s (%s); skipping", statistic_id, ex
+            )
+            continue
+        if latest is None:
+            _LOGGER.info(
+                "Bridge: no live stats yet for %s; nothing to bridge", statistic_id
+            )
+            continue
+        actual_sum = float(latest.get("sum", 0) or 0)
+        actual_state = float(latest.get("state", 0) or 0)
+        # The fully-correct sum at the latest live state, given our anchor:
+        target_sum = expected_sum + max(0.0, actual_state - expected_state)
+        adjustment = target_sum - actual_sum
+        if abs(adjustment) < 0.5:
+            _LOGGER.info(
+                "Bridge: %s already chained (sum=%.1f, target=%.1f); skipping",
+                statistic_id,
+                actual_sum,
+                target_sum,
+            )
+            continue
+        try:
+            await _adjust_sum_statistics(
+                supervisor_token,
+                statistic_id,
+                start_time_iso=seam_iso,
+                adjustment=adjustment,
+                unit_of_measurement=unit,
+            )
+        except Exception as ex:
+            _LOGGER.warning(
+                "Bridge: adjust_sum_statistics failed for %s: %s", statistic_id, ex
+            )

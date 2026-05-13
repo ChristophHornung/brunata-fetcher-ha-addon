@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.10
+
+- Backfill now auto-fixes the seam between historical and live data. The
+  Energy Dashboard used to show a giant negative bar in the current
+  month right after a backfill because Home Assistant briefly treated
+  the imported history and the live polling as disconnected histories.
+  About 6 minutes after a backfill finishes, the add-on now applies the
+  same correction Home Assistant's built-in "Adjust a statistic" tool
+  uses, automatically. You no longer need to fix anything manually after
+  a backfill.
+
 ## 0.3.9
 
 - Backfill now includes the current in-progress month too, distributing
