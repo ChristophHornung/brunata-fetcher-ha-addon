@@ -122,3 +122,5 @@ Always bump `version` in [`brunata_fetcher/config.yaml`](brunata_fetcher/config.
 **Keep entries short.** One to two plain sentences per change — lead with what changed and the benefit, then any action the user must take ("re-run the backfill after upgrading"). Drop the why and the how; nobody reads long changelog text. The existing entries are the length/voice to match.
 
 **Prefix every bullet with a gitmoji** matching the change type — ✨ new feature, 🐛 bug fix, ⚡️ performance, 🏗️ architectural change, 🔊 logging, 🎉 initial release, etc. (This is the one place emojis are wanted; code and comments stay ASCII as usual.)
+
+**Keep the user-facing docs in sync.** User documentation lives in two places: [`README.md`](README.md) (GitHub-facing, full — install, dev notes, related projects) and [`brunata_fetcher/DOCS.md`](brunata_fetcher/DOCS.md) (shown in HA's add-on Documentation tab — condensed: config, entities, backfill, troubleshooting). When a user-visible change lands — a new entity, a changed option, new behaviour — update **both**, not just one.
