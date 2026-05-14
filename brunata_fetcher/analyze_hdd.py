@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HDD-based weather-normalization analysis for the portal's heating data.
 
-Logs in via Playwright, pulls every available year's monthly Verbrauch
+Logs in over plain HTTP, pulls every available year's monthly Verbrauch
 through the same path as the backfill, then joins that with daily mean
 temperatures from Open-Meteo's free historical archive to derive
 ``kWh / Heating Degree Day`` (German G20/15 convention) per month.
@@ -30,9 +30,9 @@ import urllib.request
 from datetime import date
 from pathlib import Path
 
-from _brunata_api import _CHROMIUM_ARGS, _discover_user_context, _login
+from _brunata_api import _USER_AGENT, _discover_user_context, _login_http
 from _brunata_backfill import _fetch_history
-from run_scraper_once import _env_bool, _read_env_file
+from _env_utils import read_env_file
 
 
 def fetch_daily_temps(lat: float, lon: float, start: date, end: date) -> dict[date, float]:
@@ -68,36 +68,19 @@ def monthly_hdd(temps: dict[date, float]) -> dict[str, float]:
 
 
 async def fetch_heizung_history(
-    email: str, password: str, headless: bool, timeout_ms: int
+    email: str, password: str, timeout_s: float
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Return ``(raw_by_month, wb_by_month)`` keyed by ``YYYY-MM``."""
-    from playwright.async_api import async_playwright
+    import httpx
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless, args=_CHROMIUM_ARGS)
-        try:
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-            try:
-                page = await context.new_page()
-                page.set_default_timeout(timeout_ms)
-                try:
-                    await _login(page, email, password)
-                finally:
-                    await page.close()
-                nutzein, partner = await _discover_user_context(context.request)
-                years_data = await _fetch_history(
-                    context.request, nutzein, partner, ["Heizung"]
-                )
-            finally:
-                await context.close()
-        finally:
-            await browser.close()
+    async with httpx.AsyncClient(
+        headers={"User-Agent": _USER_AGENT},
+        timeout=httpx.Timeout(timeout_s),
+        follow_redirects=True,
+    ) as client:
+        await _login_http(client, email, password)
+        nutzein, partner = await _discover_user_context(client)
+        years_data = await _fetch_history(client, nutzein, partner, ["Heizung"])
 
     raw: dict[str, float] = {}
     wb: dict[str, float] = {}
@@ -206,21 +189,20 @@ def main() -> None:
     env_path = Path(args.env_file)
     if not env_path.is_absolute():
         env_path = Path.cwd() / env_path
-    env_values = _read_env_file(env_path)
+    env_values = read_env_file(env_path)
     env = {**os.environ, **env_values}
     email = env.get("BRUNATA_EMAIL", "").strip()
     password = env.get("BRUNATA_PASSWORD", "").strip()
     if not email or not password:
         print("Missing BRUNATA_EMAIL or BRUNATA_PASSWORD", file=sys.stderr)
         sys.exit(2)
-    headless = _env_bool(env.get("BRUNATA_HEADLESS", "true"), True)
-    timeout_ms = int(env.get("BRUNATA_PLAYWRIGHT_TIMEOUT_MS", "60000"))
+    timeout_s = float(env.get("BRUNATA_HTTP_TIMEOUT_S", "60"))
 
     print(
         f"Fetching Heizung history from portal and daily mean temps for "
         f"({args.lat}, {args.lon}) starting {args.start}..."
     )
-    raw, wb = asyncio.run(fetch_heizung_history(email, password, headless, timeout_ms))
+    raw, wb = asyncio.run(fetch_heizung_history(email, password, timeout_s))
     temps = fetch_daily_temps(args.lat, args.lon, date.fromisoformat(args.start), date.today())
     hdd_monthly = monthly_hdd(temps)
     _print_report(raw, wb, hdd_monthly, args.reference_hdd)

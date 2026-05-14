@@ -28,14 +28,14 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from _brunata_api import (
-    _CHROMIUM_ARGS,
     _ENERGY_TYPE_KOTYP,
     _ROOM_LABELS,
     _SAP_CLIENT,
+    _USER_AGENT,
     _UVI_BASE,
     _build_uvi_inner_get,
     _discover_user_context,
-    _login,
+    _login_http,
     _odata_batch_get,
     _parse_sap_date,
     _results,
@@ -98,9 +98,12 @@ def _slug_for_room(name: str) -> str:
 
 
 async def _fetch_history(
-    request, nutzein: str, partner: str, energy_types: list[str]
+    client, nutzein: str, partner: str, energy_types: list[str]
 ) -> list[dict]:
-    """Fetch every year's monthly + per-room data from NP_UVI_SRV."""
+    """Fetch every year's monthly + per-room data from NP_UVI_SRV.
+
+    ``client`` is an ``httpx.AsyncClient`` carrying the SAP session cookies.
+    """
     from urllib.parse import quote
 
     filter_qs = quote(
@@ -112,7 +115,7 @@ async def _fetch_history(
         f"&$filter={filter_qs}"
     )
     dates_payloads = await _odata_batch_get(
-        request,
+        client,
         _UVI_BASE,
         [dates_inner],
         user_unit_id=nutzein,
@@ -206,7 +209,7 @@ async def _fetch_history(
         index_map.append(("rooms", ""))
 
         payloads = await _odata_batch_get(
-            request,
+            client,
             _UVI_BASE,
             inner_gets,
             user_unit_id=nutzein,
@@ -654,41 +657,23 @@ async def backfill_history(
     email: str,
     password: str,
     energy_types: list[str],
-    headless: bool = True,
-    playwright_timeout: int = 60000,
+    http_timeout: float = 60.0,
 ) -> None:
     """End-to-end backfill driven by the values configured for the live fetch."""
-    from playwright.async_api import async_playwright
+    import httpx
 
     start = time.monotonic()
     _LOGGER.info("Backfill: starting, energy_types=%s", energy_types)
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless, args=_CHROMIUM_ARGS)
-        try:
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-            try:
-                page = await context.new_page()
-                page.set_default_timeout(playwright_timeout)
-                try:
-                    await _login(page, email, password)
-                finally:
-                    await page.close()
-                _LOGGER.info("Backfill: login complete; fetching history")
-                nutzein, partner = await _discover_user_context(context.request)
-                years_data = await _fetch_history(
-                    context.request, nutzein, partner, energy_types
-                )
-            finally:
-                await context.close()
-        finally:
-            await browser.close()
+    async with httpx.AsyncClient(
+        headers={"User-Agent": _USER_AGENT},
+        timeout=httpx.Timeout(http_timeout),
+        follow_redirects=True,
+    ) as client:
+        await _login_http(client, email, password)
+        _LOGGER.info("Backfill: login complete; fetching history")
+        nutzein, partner = await _discover_user_context(client)
+        years_data = await _fetch_history(client, nutzein, partner, energy_types)
 
     # Resolve unique_id -> current entity_id from HA's entity registry, so
     # we import stats to renamed entities under their new name. Live-polling

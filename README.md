@@ -8,7 +8,7 @@ Keywords: Brunata München Nutzerportal, BRUdirekt, BRUNATA-METRONA.
 
 ## Features
 
-- Cookie-authed OData fetch (~10 s per cycle, no DOM-scrape brittleness)
+- Pure-HTTP OData fetch (~6 s per cycle, no browser, no DOM-scrape brittleness)
 - Energy types `Heizung`, `Kaltwasser`, `Warmwasser`
 - **Per-room heating breakdown** in kWh, derived from the portal's
   `Raumvergleich` distribution × the heating YTD total
@@ -36,12 +36,11 @@ Keywords: Brunata München Nutzerportal, BRUdirekt, BRUNATA-METRONA.
 
 1. **Settings → Add-ons → Add-on Store → ⋮ → Repositories** and add
    `https://github.com/ChristophHornung/brunata-fetcher-ha-addon`.
-2. Find **Brunata Fetcher** in the store and click **Install**. First
-   build takes a few minutes (Playwright + Chromium download into the
-   container image).
+2. Find **Brunata Fetcher** in the store and click **Install**. The image
+   is small (pure Python, no browser bundled) so the build is quick.
 3. Configure `email` and `password` (and MQTT options if not using
    Supervisor auto-discovery).
-4. Start the add-on. Each fetch cycle runs in ~10 s; the default poll
+4. Start the add-on. Each fetch cycle runs in ~6 s; the default poll
    interval is 24 h.
 5. New entities appear under the **BRUdirekt** MQTT device in HA.
 
@@ -195,14 +194,18 @@ cp brunata_fetcher/.env.example brunata_fetcher/.env
 # Edit BRUNATA_EMAIL + BRUNATA_PASSWORD
 
 cd brunata_fetcher
-pip install -r requirements.txt
-python -m playwright install chromium     # one-time ~300 MB download
 
+# Production deps only (what the container installs) — pure Python, no browser
+pip install -r requirements.txt
 python smoke_local.py                     # parser + MQTT payload check, offline
-python run_api_once.py                    # current production fetch path
+python run_api_once.py                    # current production fetch path (pure HTTP)
+
+# Dev + investigation deps — adds Playwright for the browser-driven scripts
+pip install -r requirements-dev.txt
+python -m playwright install chromium     # one-time ~300 MB download, dev only
 python run_scraper_once.py                # legacy DOM scraper
 python explore_portal.py                  # interactive non-headless explorer
 ```
 
-`BRUNATA_DEBUG=true` in `.env` writes HTML / screenshot / network-log
-dumps to the system temp dir during any of the runs above.
+`BRUNATA_DEBUG=true` in `.env` enables extra diagnostic dumps to the system
+temp dir during the browser-driven runs above.

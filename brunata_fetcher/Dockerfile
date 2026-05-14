@@ -7,16 +7,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps + the Playwright Chromium headless-shell variant. The shell
-# is ~100 MB instead of ~300 MB for the full Chromium build and `--with-deps`
-# pulls a smaller set of system libs (no X11 / GTK / audio). server.py always
-# launches with headless=True, so the full Chromium build would just be dead
-# weight in the image. Apt lists pulled in by `--with-deps` are cleaned in
-# the same RUN.
+# Python deps only — the add-on talks to the Brunata portal over plain HTTP
+# (login included), so there's no browser to install. requirements.txt is
+# httpx + paho-mqtt + websockets; no Playwright, no Chromium.
 COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/requirements.txt \
-    && playwright install chromium-headless-shell --with-deps \
-    && rm -rf /var/lib/apt/lists/* /tmp/requirements.txt
+    && rm -rf /tmp/requirements.txt
 
 # Copy add-on scripts
 COPY *.py /app/

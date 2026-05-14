@@ -4,16 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A Home Assistant add-on that pulls consumption data (heating, cold water, warm water) from the **Brunata München Nutzerportal / BRUdirekt** and publishes MQTT Discovery entities. Ships as a Docker container with Python + Playwright + Chromium baked in. The portal is a SAP NetWeaver / SAPUI5 frontend backed by OData v2 services.
+A Home Assistant add-on that pulls consumption data (heating, cold water, warm water) from the **Brunata München Nutzerportal / BRUdirekt** and publishes MQTT Discovery entities. Ships as a Docker container — pure Python, no browser. The portal is a SAP NetWeaver / SAPUI5 frontend backed by OData v2 services, and the add-on talks to it entirely over plain HTTP (`httpx`), login included.
 
-It exists as an add-on (not a custom HA integration) because an earlier integration-form attempt hit unreliable Playwright auto-install on the HA core runtime. Shipping Playwright + Chromium baked into the addon container sidesteps that entirely. Don't move Playwright installation to runtime — keep it container-build based.
+It exists as an add-on (not a custom HA integration) for historical reasons: an earlier integration-form attempt hit unreliable Playwright auto-install on the HA core runtime, so the project shipped Playwright + Chromium baked into an addon container instead. As of **v0.4.0** the production path no longer uses a browser at all — the login was reverse-engineered to a plain HTTP call — so that constraint is gone, but the add-on form is kept.
 
-## Architecture pivot (read first)
+## Architecture pivots (read first)
 
-The codebase shifted from DOM scraping to a cookie-authed OData API in **v0.3.0**. Both paths still live in the tree and that's intentional. The README predates the pivot and describes the old architecture — trust `docs/portal-api.md` and the code over it.
+Two pivots shaped the codebase; both old paths still live in the tree, intentionally. Trust `docs/portal-api.md` and the code over the README.
 
-- **Production path:** [`brunata_fetcher/_brunata_api.py`](brunata_fetcher/_brunata_api.py). Playwright logs in (one-shot, to obtain SAP session cookies); subsequent data fetches POST to `NP_UVI_SRV/$batch` directly. A full cycle is ~10s.
-- **Legacy/fallback path:** [`brunata_fetcher/_brunata_scraper.py`](brunata_fetcher/_brunata_scraper.py). DOM-scrapes the Verbrauch widget via Playwright. ~19s, brittle to portal UI changes. Kept as a reference and for emergency fallback.
+- **v0.3.0** — DOM scraping → cookie-authed OData API.
+- **v0.4.0** — Playwright → pure HTTP. The browser login was reverse-engineered to a plain two-step HTTP call (validate credentials, then a Basic-auth session GET — see `docs/portal-api.md`), so the production path no longer launches a browser. `httpx` is the only HTTP dependency; Playwright is dev-only.
+
+- **Production path:** [`brunata_fetcher/_brunata_api.py`](brunata_fetcher/_brunata_api.py). `_login_http` does the two-step HTTP login to obtain SAP session cookies on an `httpx.AsyncClient`; subsequent data fetches POST to `NP_UVI_SRV/$batch` on the same client. A full cycle is ~6s.
+- **Legacy/fallback path:** [`brunata_fetcher/_brunata_scraper.py`](brunata_fetcher/_brunata_scraper.py). DOM-scrapes the Verbrauch widget via Playwright. Brittle to portal UI changes, needs `requirements-dev.txt`. Kept as a reference only.
 - **Investigation tooling:** several non-production helper scripts for poking at the portal API and the consumption data — see [Analysis & investigation scripts](#analysis--investigation-scripts). Reach for them when the API changes or the data looks off, before touching production code.
 
 [`server.py`](brunata_fetcher/server.py) is the long-running HA entrypoint — reads `/data/options.json`, connects to MQTT, runs the fetch loop, publishes Discovery + state.
@@ -43,31 +46,34 @@ One HA device (`BRUdirekt`). Entity IDs are derived from `unique_id` in the Disc
 
 ## Login failure detection
 
-The legacy scraper detects login failures by substring-matching error words against the page body, gated on the URL still being on the login domain. The new API path detects them via HTTP status / OData error envelopes. Both raise `RuntimeError("LOGIN_FAILED")` — `server.py` translates that into a user-facing log line. If you change either path, keep the sentinel string intact.
+The HTTP path (`_login_http`) detects bad credentials from the inner `$batch` response: `validLCR` comes back with an OData error envelope, code `/BME/KP_MSG_CORE/008` (and no `Userid` / no session cookie). The legacy scraper detects failures by substring-matching error words against the page body, gated on the URL still being on the login domain. Both raise `RuntimeError("LOGIN_FAILED")` — `server.py` translates that into a user-facing log line. If you change either path, keep the sentinel string intact.
 
 ## Common commands
 
 Run from `brunata_fetcher/` (the addon directory) unless noted.
 
 ```powershell
-# One-time setup
+# Production deps only (what the container installs) — pure Python, no browser
 pip install -r requirements.txt
-python -m playwright install chromium      # ~300 MB download
+
+# Dev + investigation deps — adds Playwright for the browser-driven scripts
+pip install -r requirements-dev.txt
+python -m playwright install chromium      # ~300 MB download, dev only
 
 # Smoke test — parser + MQTT payload shape, no network
 python smoke_local.py
 
-# End-to-end against the real portal (current production path)
+# End-to-end against the real portal (current production path, pure HTTP)
 python run_api_once.py
 
-# End-to-end against the real portal via the legacy DOM scraper
+# End-to-end against the real portal via the legacy DOM scraper (needs Playwright)
 python run_scraper_once.py
 
 # Compile-check before committing
-python -m py_compile _brunata_api.py server.py
+python -m py_compile _brunata_api.py _brunata_backfill.py server.py
 ```
 
-For the API/data investigation helpers (`explore_portal.py`, `probe_freshness.py`, `dump_monthly.py`, `analyze_hdd.py`, …) see the next section.
+For the API/data investigation helpers (`explore_portal.py`, `probe_login.py`, `probe_freshness.py`, `dump_monthly.py`, `analyze_hdd.py`, …) see the next section.
 
 Local credentials live in [`brunata_fetcher/.env`](brunata_fetcher/.env) (gitignored). `BRUNATA_DEBUG=true` enables HTML/screenshot/network-log dumps to `tempfile.gettempdir()` during any run.
 
@@ -75,7 +81,13 @@ Local credentials live in [`brunata_fetcher/.env`](brunata_fetcher/.env) (gitign
 
 Non-production helpers for poking at the portal API and the consumption data — **internal tooling, not shipped or referenced by the addon**. None are wired into `server.py`; all need `.env` credentials and run from `brunata_fetcher/`. Keep them around: they're the first thing to reach for when the API changes or the data looks wrong, before editing production code.
 
+Dependency-wise they split two ways:
+
+- **httpx-only** (`requirements.txt` is enough): `probe_freshness.py`, `dump_monthly.py`, `analyze_hdd.py` — they use the production `_login_http` + OData helpers.
+- **browser-driven** (`requirements-dev.txt` + `playwright install chromium`): `explore_portal.py`, `probe_login.py`, and the legacy `run_scraper_once.py`.
+
 - `explore_portal.py` — interactive non-headless browser. Logs in, opens the Verbrauch page, hands you the browser to click around. All traffic captured to `%TEMP%/portal_network.jsonl`.
+- `probe_login.py` — drives the browser login and records every request/response (with the email/password redacted), so you can see exactly what the SAPUI5 "Anmelden" button sends. This is how the two-step HTTP login in `_login_http` was reverse-engineered. Run with `--bad-password` to capture the failure envelope.
 - `explore_uvi_dates.py` — one-shot probe of `NP_UVI_SRV` `Bis`/`Datum` parameter behaviour (how the portal interprets non-month-end `Bis`, ignores `Datum` filters, etc.).
 - `probe_freshness.py` — dumps the full OData row structure of `UserContextSet` / `DatesSet` / `CumuConsumptionMonSet` (we only parse 2 of ~10 fields in production) plus the `$metadata` entity-set + property inventory. Written to answer "does the portal expose a last-refreshed timestamp?" — it doesn't, but `Vbkz='E'` on a `CumuConsumptionMonSet` row flags the in-progress month's *estimated* value vs. `Vbkz=''` for closed months.
 - `dump_monthly.py` — prints per-month raw + weather-adjusted (`IsWeatherAdjusted`) Heizung values across all years, mirroring exactly what the backfill imports. Good for sanity-checking the WB sensor.
@@ -92,7 +104,8 @@ When `BRUNATA_DEBUG=true` (either via `.env` for local runs, or `advanced.debug:
 
 - Local dev is Windows + PowerShell; the addon runtime is Debian Linux.
 - Python 3.14 locally, 3.x (system) in the addon container.
-- Long-running command: `python -m playwright install chromium` takes a few minutes.
+- The container installs `requirements.txt` only (`httpx`, `paho-mqtt`, `websockets`). Playwright is in `requirements-dev.txt` — dev/investigation only.
+- Long-running command: `python -m playwright install chromium` (dev only) takes a few minutes.
 - The repo's git identity is set per-repo (`Christoph Hornung <christoph.hornung@crosberg.de>`), not global.
 
 ## Conventions

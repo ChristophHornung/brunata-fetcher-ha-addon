@@ -14,39 +14,24 @@ import os
 import sys
 from pathlib import Path
 
-from _brunata_api import _CHROMIUM_ARGS, _discover_user_context, _login
+from _brunata_api import _USER_AGENT, _discover_user_context, _login_http
 from _brunata_backfill import _fetch_history
-from run_scraper_once import _env_bool, _read_env_file
+from _env_utils import read_env_file
 
 
-async def _main_async(email: str, password: str, headless: bool, timeout_ms: int) -> None:
-    from playwright.async_api import async_playwright
+async def _main_async(email: str, password: str, timeout_s: float) -> None:
+    import httpx
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless, args=_CHROMIUM_ARGS)
-        try:
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-            try:
-                page = await context.new_page()
-                page.set_default_timeout(timeout_ms)
-                try:
-                    await _login(page, email, password)
-                finally:
-                    await page.close()
-                nutzein, partner = await _discover_user_context(context.request)
-                years_data = await _fetch_history(
-                    context.request, nutzein, partner, ["Heizung", "Kaltwasser", "Warmwasser"]
-                )
-            finally:
-                await context.close()
-        finally:
-            await browser.close()
+    async with httpx.AsyncClient(
+        headers={"User-Agent": _USER_AGENT},
+        timeout=httpx.Timeout(timeout_s),
+        follow_redirects=True,
+    ) as client:
+        await _login_http(client, email, password)
+        nutzein, partner = await _discover_user_context(client)
+        years_data = await _fetch_history(
+            client, nutzein, partner, ["Heizung", "Kaltwasser", "Warmwasser"]
+        )
 
     print()
     print("=" * 78)
@@ -93,17 +78,16 @@ def main() -> None:
     if not env_path.is_absolute():
         env_path = Path.cwd() / env_path
 
-    env_values = _read_env_file(env_path)
+    env_values = read_env_file(env_path)
     env = {**os.environ, **env_values}
     email = env.get("BRUNATA_EMAIL", "").strip()
     password = env.get("BRUNATA_PASSWORD", "").strip()
     if not email or not password:
         print("Missing BRUNATA_EMAIL or BRUNATA_PASSWORD", file=sys.stderr)
         sys.exit(2)
-    headless = _env_bool(env.get("BRUNATA_HEADLESS", "true"), True)
-    timeout_ms = int(env.get("BRUNATA_PLAYWRIGHT_TIMEOUT_MS", "60000"))
+    timeout_s = float(env.get("BRUNATA_HTTP_TIMEOUT_S", "60"))
 
-    asyncio.run(_main_async(email, password, headless, timeout_ms))
+    asyncio.run(_main_async(email, password, timeout_s))
 
 
 if __name__ == "__main__":

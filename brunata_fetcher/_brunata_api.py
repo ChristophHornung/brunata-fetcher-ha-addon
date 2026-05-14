@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Cookie-authed Brunata OData fetcher.
 
-Logs in via Playwright (to obtain the SAP session cookies), then makes plain
-OData GETs against ``NP_UVI_SRV`` for consumption, per-room, and building
-comparison data. See ``docs/portal-api.md`` for the reverse-engineered
-reference of the endpoints used here.
+Pure-HTTP path: logs in by POSTing credentials to the
+``NP_REG_LOGON_SRV_01/CredentialSet`` ``$batch`` endpoint (the same call
+the SAPUI5 "Anmelden" button makes — see ``_login_http``), then reuses
+the resulting SAP session cookies for plain OData calls against
+``NP_UVI_SRV``. No browser involved. See ``docs/portal-api.md`` for the
+reverse-engineered reference of the endpoints used here.
+
+The browser-based ``_login`` (and the ``_SEL_*`` / ``_CHROMIUM_ARGS``
+constants) are kept for the investigation scripts — they're plain Python
+and don't import Playwright, so they don't drag a browser dependency
+into the production import path.
 
 Output on success::
 
@@ -55,7 +62,17 @@ _PORTAL_HOST = "https://nutzerportal.brunata-muenchen.de"
 _LOGIN_URL = f"{_PORTAL_HOST}/np_anmeldung/index.html?sap-language=DE"
 _UVI_BASE = f"{_PORTAL_HOST}/sap/opu/odata/bme/NP_UVI_SRV"
 _APPLAUNCHER_BASE = f"{_PORTAL_HOST}/sap/opu/odata/bme/NP_APPLAUNCHER_SRV"
+_LOGON_BASE = f"{_PORTAL_HOST}/sap/opu/odata/bme/NP_REG_LOGON_SRV_01"
 _SAP_CLIENT = "201"
+
+# Sent on every httpx request. The portal is a SAP backend that doesn't
+# really care about the UA, but matching what the SAPUI5 frontend sends
+# keeps our traffic indistinguishable from a real browser session.
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 _SEL_EMAIL = "#__component0---Start--idEmailInput-inner"
 _SEL_PASSWORD = "#__component0---Start--idPassword-inner"
@@ -85,22 +102,22 @@ class FetcherConfig(TypedDict, total=False):
     """Config accepted by ``fetch``.
 
     ``email`` / ``password`` / ``energy_types`` are required at runtime;
-    the rest are optional.
+    ``http_timeout`` (seconds) is optional.
     """
 
     email: str
     password: str
     energy_types: list[str]
-    headless: bool
-    debug: bool
-    playwright_timeout: int
+    http_timeout: float
 
 
 _REQUIRED_CONFIG_KEYS: tuple[str, ...] = ("email", "password", "energy_types")
 
 
-# Chromium flags — same logic as _brunata_scraper.py. Kept inline here so the
-# API module stays self-contained.
+# Chromium flags for the browser-based login. The production fetch path no
+# longer uses a browser at all (see _login_http), but the investigation
+# scripts and the legacy scraper still drive Chromium, and they import this
+# list from here. Plain data — no Playwright import.
 _CHROMIUM_ARGS: list[str] = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
@@ -181,14 +198,16 @@ def _odata_filter(parts: list[str]) -> str:
     return quote(" and ".join(parts), safe="")
 
 
-async def _odata_get(request, url: str) -> dict:
+async def _odata_get(client, url: str) -> dict:
     """GET an OData JSON resource and parse it. Raises on non-2xx.
 
     Note: not all SAP entity sets accept direct GETs; many production OData
     services require the ``$batch`` envelope. Use :func:`_odata_batch_get`
     for those.
+
+    ``client`` is an ``httpx.AsyncClient`` carrying the SAP session cookies.
     """
-    response = await request.get(
+    response = await client.get(
         url,
         headers={
             "Accept": "application/json",
@@ -196,26 +215,28 @@ async def _odata_get(request, url: str) -> dict:
             "MaxDataServiceVersion": "2.0",
         },
     )
-    if not response.ok:
-        body_preview = (await response.text())[:300]
+    if not response.is_success:
+        body_preview = response.text[:300]
         raise RuntimeError(
-            f"OData GET failed: status={response.status} url={url} body={body_preview!r}"
+            f"OData GET failed: status={response.status_code} url={url} "
+            f"body={body_preview!r}"
         )
-    return await response.json()
+    return response.json()
 
 
-async def _fetch_csrf_token(request, service_base: str) -> str:
+async def _fetch_csrf_token(client, service_base: str) -> str:
     """Fetch the SAP X-CSRF-Token for a service. Required for ``$batch`` POST."""
-    response = await request.fetch(
+    response = await client.request(
+        "HEAD",
         f"{service_base}/?sap-client={_SAP_CLIENT}",
-        method="HEAD",
         headers={"X-CSRF-Token": "Fetch"},
     )
-    if not response.ok:
+    if not response.is_success:
         raise RuntimeError(
-            f"CSRF token fetch failed: status={response.status} url={service_base}"
+            f"CSRF token fetch failed: status={response.status_code} "
+            f"url={service_base}"
         )
-    # Playwright lower-cases header names.
+    # httpx headers are case-insensitive.
     token = response.headers.get("x-csrf-token", "")
     if not token or token.lower() == "required":
         raise RuntimeError(f"CSRF token fetch returned {token!r}")
@@ -223,13 +244,23 @@ async def _fetch_csrf_token(request, service_base: str) -> str:
 
 
 def _parse_batch_response(text: str) -> list[dict]:
-    """Split a ``multipart/mixed`` ``$batch`` response into JSON payloads."""
+    """Extract JSON payloads from a SAP ``$batch`` ``multipart/mixed`` response.
+
+    Handles both shapes the portal returns:
+
+    * **Flat** — each outer part is a direct ``application/http`` response
+      (what the data-path batched GETs produce).
+    * **Nested** — each outer part is itself a ``multipart/mixed`` changeset
+      wrapping the ``application/http`` response (what a changeset POST,
+      e.g. the login ``CredentialSet`` call, produces).
+
+    In both shapes the JSON body sits after the inner ``HTTP/1.1 <status>``
+    line and the blank line that ends that response's headers — so we anchor
+    on ``HTTP/1.1`` rather than counting blank-line markers.
+    """
     # The outer boundary is the first line starting with ``--``.
-    lines = text.split("\r\n")
-    if not lines:
-        return []
     outer = ""
-    for line in lines:
+    for line in text.split("\r\n"):
         stripped = line.strip()
         if stripped.startswith("--") and stripped != "--":
             outer = stripped.rstrip("-")
@@ -237,26 +268,25 @@ def _parse_batch_response(text: str) -> list[dict]:
     if not outer:
         raise RuntimeError("Could not find outer multipart boundary")
 
-    parts = text.split(outer)
     payloads: list[dict] = []
-    for part in parts:
-        # Each inner part contains its own HTTP response. Find the JSON body
-        # (after the blank line that follows the inner HTTP headers).
+    for part in text.split(outer):
+        # Anchor on the inner HTTP response; the JSON body starts after the
+        # blank line that ends that response's headers.
+        http_idx = part.find("HTTP/1.1")
+        if http_idx < 0:
+            continue
         marker = "\r\n\r\n"
-        # First blank line ends the multipart headers, second ends the inner
-        # HTTP response headers, then the JSON body starts.
-        first = part.find(marker)
-        if first < 0:
+        body_start = part.find(marker, http_idx)
+        if body_start < 0:
             continue
-        second = part.find(marker, first + len(marker))
-        if second < 0:
+        body = part[body_start + len(marker) :].strip()
+        # Trim any trailing multipart boundary lines after the JSON object.
+        last_brace = body.rfind("}")
+        if last_brace < 0:
             continue
-        body = part[second + len(marker) :].strip()
-        if not body or not body.startswith("{"):
+        body = body[: last_brace + 1]
+        if not body.startswith("{"):
             continue
-        # Trim a trailing boundary line ("--") that may be appended.
-        if body.endswith("--"):
-            body = body.rsplit("\n", 1)[0].strip()
         try:
             payloads.append(json.loads(body))
         except json.JSONDecodeError:
@@ -265,7 +295,7 @@ def _parse_batch_response(text: str) -> list[dict]:
 
 
 async def _odata_batch_get(
-    request,
+    client,
     service_base: str,
     inner_gets: list[str],
     *,
@@ -274,6 +304,7 @@ async def _odata_batch_get(
 ) -> list[dict]:
     """Send a batched GET to a SAP OData v2 service.
 
+    ``client`` is an ``httpx.AsyncClient`` carrying the SAP session cookies.
     ``inner_gets`` is a list of paths relative to the service root (e.g.
     ``CumuConsumptionMonSet?$filter=...``). Returns one parsed JSON payload
     per inner GET, in the same order.
@@ -286,7 +317,7 @@ async def _odata_batch_get(
     """
     import uuid
 
-    token = await _fetch_csrf_token(request, service_base)
+    token = await _fetch_csrf_token(client, service_base)
     boundary = "batch_" + uuid.uuid4().hex
 
     crlf = "\r\n"
@@ -321,7 +352,7 @@ async def _odata_batch_get(
     body_parts.append(f"--{boundary}--{crlf}")
     body = "".join(body_parts)
 
-    response = await request.post(
+    response = await client.post(
         f"{service_base}/$batch?sap-client={_SAP_CLIENT}",
         headers={
             "Content-Type": f"multipart/mixed; boundary={boundary}",
@@ -333,14 +364,15 @@ async def _odata_batch_get(
             "sap-contextid-accept": "header",
             "X-Requested-With": "XMLHttpRequest",
         },
-        data=body,
+        content=body,
     )
-    if not response.ok:
-        body_preview = (await response.text())[:300]
+    if not response.is_success:
+        body_preview = response.text[:300]
         raise RuntimeError(
-            f"$batch POST failed: status={response.status} body={body_preview!r}"
+            f"$batch POST failed: status={response.status_code} "
+            f"body={body_preview!r}"
         )
-    text = await response.text()
+    text = response.text
     payloads = _parse_batch_response(text)
     if len(payloads) != len(inner_gets):
         _LOGGER.warning(
@@ -369,7 +401,7 @@ def _results(payload: dict) -> list[dict]:
 # --- OData queries ----------------------------------------------------------
 
 
-async def _discover_user_context(request) -> tuple[str, str]:
+async def _discover_user_context(client) -> tuple[str, str]:
     """Return ``(UserUnitID, Partner)`` from the app-launcher user context.
 
     SAP's backend uses these two as application-level headers (``UserUnitID``
@@ -378,7 +410,7 @@ async def _discover_user_context(request) -> tuple[str, str]:
     500.
     """
     url = f"{_APPLAUNCHER_BASE}/UserContextSet?sap-client={_SAP_CLIENT}"
-    payload = await _odata_get(request, url)
+    payload = await _odata_get(client, url)
     rows = _results(payload)
     if not rows:
         raise RuntimeError("UserContextSet returned no rows")
@@ -392,7 +424,7 @@ async def _discover_user_context(request) -> tuple[str, str]:
 
 
 async def _discover_period(
-    request, nutzein: str, partner: str
+    client, nutzein: str, partner: str
 ) -> tuple[str, str]:
     """Return ``(query_bis_literal, official_last_update_iso)``.
 
@@ -418,7 +450,7 @@ async def _discover_period(
         f"&$filter={filter_qs}"
     )
     payloads = await _odata_batch_get(
-        request,
+        client,
         _UVI_BASE,
         [inner],
         user_unit_id=nutzein,
@@ -556,62 +588,190 @@ async def _login(page, email: str, password: str) -> None:
             raise RuntimeError("LOGIN_FAILED")
 
 
+async def _login_http(client, email: str, password: str) -> None:
+    """Log in to the portal over plain HTTP — no browser, no JS.
+
+    Mirrors what the SAPUI5 "Anmelden" button does, in two steps:
+
+    1. POST the credentials to ``NP_REG_LOGON_SRV_01/CredentialSet`` inside
+       a ``$batch`` changeset (password is just Base64-encoded plaintext,
+       no client-side crypto). This *validates* the email/password and
+       returns the SAP ``Userid`` + service URL.
+    2. GET the service URL with HTTP Basic auth (``Userid:password``).
+       That's the call SAP answers with the ``MYSAPSSO2`` logon ticket +
+       ``SAP_SESSIONID`` session cookie — every later OData call on
+       ``client`` reuses them.
+
+    Raises ``RuntimeError("LOGIN_FAILED")`` on bad credentials — step 1
+    returns an OData error envelope (code ``/BME/KP_MSG_CORE/008``) — or if
+    no session cookie ends up set.
+    """
+    import base64
+    import uuid
+
+    # HEAD warms the logon service and seeds the initial SAP cookies; the
+    # SAPUI5 frontend does this before the credential POST, so we mirror it.
+    # The credential POST itself doesn't carry an X-CSRF-Token (it's the
+    # session-creating call), so a failure here isn't fatal.
+    try:
+        await client.request(
+            "HEAD",
+            f"{_LOGON_BASE}/?sap-client={_SAP_CLIENT}",
+            headers={"X-CSRF-Token": "Fetch"},
+        )
+    except Exception as ex:  # pragma: no cover - best-effort warmup
+        _LOGGER.debug("Logon-service HEAD warmup failed (%s); continuing", ex)
+
+    pw_b64 = base64.b64encode(password.encode("utf-8")).decode("ascii")
+    inner_json = json.dumps(
+        {"Action": "validLCR", "Email": email, "Password": pw_b64},
+        separators=(",", ":"),
+    )
+
+    crlf = "\r\n"
+    batch_boundary = "batch_" + uuid.uuid4().hex
+    changeset_boundary = "changeset_" + uuid.uuid4().hex
+    inner_request = "".join(
+        [
+            f"POST CredentialSet?sap-client={_SAP_CLIENT} HTTP/1.1{crlf}",
+            f"X-Requested-With: XMLHttpRequest{crlf}",
+            f"sap-contextid-accept: header{crlf}",
+            f"Accept: application/json{crlf}",
+            f"Accept-Language: de{crlf}",
+            f"DataServiceVersion: 2.0{crlf}",
+            f"MaxDataServiceVersion: 2.0{crlf}",
+            f"Content-Type: application/json{crlf}",
+            f"Content-ID: id-{uuid.uuid4().hex}{crlf}",
+            f"Content-Length: {len(inner_json.encode('utf-8'))}{crlf}",
+            crlf,
+            inner_json,
+        ]
+    )
+    body = "".join(
+        [
+            crlf,  # frontend prepends one CRLF
+            f"--{batch_boundary}{crlf}",
+            f"Content-Type: multipart/mixed; boundary={changeset_boundary}{crlf}",
+            crlf,
+            f"--{changeset_boundary}{crlf}",
+            f"Content-Type: application/http{crlf}",
+            f"Content-Transfer-Encoding: binary{crlf}",
+            crlf,
+            inner_request,
+            crlf,
+            f"--{changeset_boundary}--{crlf}",
+            crlf,
+            f"--{batch_boundary}--{crlf}",
+        ]
+    )
+
+    response = await client.post(
+        f"{_LOGON_BASE}/$batch?sap-client={_SAP_CLIENT}",
+        headers={
+            "Content-Type": f"multipart/mixed; boundary={batch_boundary}",
+            "Accept": "multipart/mixed",
+            "X-Requested-With": "XMLHttpRequest",
+            "DataServiceVersion": "2.0",
+            "MaxDataServiceVersion": "2.0",
+        },
+        content=body,
+    )
+    # The outer $batch POST returns HTTP 202 even when the login fails — the
+    # real status is in the inner part. A non-2xx outer status is its own
+    # kind of failure (service down, etc.).
+    if not response.is_success:
+        raise RuntimeError(
+            f"login $batch POST failed: status={response.status_code}"
+        )
+
+    # validLCR *validates* the email/password and, on success, returns the
+    # SAP Userid plus the service URL. On bad credentials it returns an
+    # OData error envelope (code /BME/KP_MSG_CORE/008) instead.
+    userid = ""
+    serviceurl = ""
+    for payload in _parse_batch_response(response.text):
+        if not isinstance(payload, dict):
+            continue
+        if "error" in payload:
+            err = payload.get("error") or {}
+            code = err.get("code", "")
+            message = err.get("message")
+            msg_value = (
+                message.get("value", "")
+                if isinstance(message, dict)
+                else str(message or "")
+            )
+            _LOGGER.error(
+                "Login rejected by portal: code=%s message=%s", code, msg_value
+            )
+            raise RuntimeError("LOGIN_FAILED")
+        d = payload.get("d")
+        if isinstance(d, dict) and d.get("Action") == "validLCR":
+            userid = str(d.get("Userid") or "").strip()
+            serviceurl = str(d.get("Serviceurl") or "").strip()
+    if not userid:
+        _LOGGER.error("validLCR returned no Userid; treating as login failure")
+        raise RuntimeError("LOGIN_FAILED")
+
+    # validLCR only validates — it doesn't open a session. The SAPUI5
+    # frontend then GETs the service URL with HTTP Basic auth
+    # (Userid:password, *not* the email); that's the call SAP answers with
+    # the MYSAPSSO2 logon ticket + SAP_SESSIONID session cookie.
+    service_url = serviceurl or "nutzerportal.brunata-muenchen.de/np_dienste"
+    if not service_url.startswith("http"):
+        service_url = f"https://{service_url}"
+    basic = base64.b64encode(
+        f"{userid}:{password}".encode("utf-8")
+    ).decode("ascii")
+    session_response = await client.get(
+        service_url, headers={"Authorization": f"Basic {basic}"}
+    )
+    if not session_response.is_success:
+        raise RuntimeError(
+            f"session GET failed: status={session_response.status_code}"
+        )
+    # Belt-and-braces: a successful session GET always sets the SSO ticket.
+    if "MYSAPSSO2" not in client.cookies:
+        _LOGGER.error(
+            "Session GET set no MYSAPSSO2 cookie; treating as login failure"
+        )
+        raise RuntimeError("LOGIN_FAILED")
+
+
 # --- Public API -------------------------------------------------------------
 
 
 async def fetch(config: FetcherConfig) -> dict:
-    """End-to-end: login, fetch OData, return structured result."""
-    from playwright.async_api import async_playwright
+    """End-to-end: HTTP login, fetch OData, return structured result."""
+    import httpx
 
     start = time.monotonic()
     email = config["email"]
     password = config["password"]
     energy_types = config["energy_types"]
-    headless = config.get("headless", True)
-    pw_timeout = config.get("playwright_timeout", 30000)
+    timeout_s = float(config.get("http_timeout", 60))
 
     masked = f"***{email[-4:]}" if len(email) >= 4 else "***"
-    _LOGGER.info(
-        "Fetcher entry: user=%s energy_types=%s headless=%s",
-        masked,
-        energy_types,
-        headless,
-    )
+    _LOGGER.info("Fetcher entry: user=%s energy_types=%s", masked, energy_types)
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless, args=_CHROMIUM_ARGS)
-        try:
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-            try:
-                page = await context.new_page()
-                page.set_default_timeout(pw_timeout)
-                try:
-                    await _login(page, email, password)
-                finally:
-                    await page.close()
-                _LOGGER.info("Login complete; switching to OData calls")
-
-                result = await _fetch_all(context.request, energy_types)
-            finally:
-                await context.close()
-        finally:
-            await browser.close()
+    async with httpx.AsyncClient(
+        headers={"User-Agent": _USER_AGENT},
+        timeout=httpx.Timeout(timeout_s),
+        follow_redirects=True,
+    ) as client:
+        await _login_http(client, email, password)
+        _LOGGER.info("Login complete; switching to OData calls")
+        result = await _fetch_all(client, energy_types)
 
     duration = time.monotonic() - start
     _LOGGER.info("Fetcher exit in %.2fs", duration)
     return result
 
 
-async def _fetch_all(request, energy_types: list[str]) -> dict:
-    nutzein, partner = await _discover_user_context(request)
+async def _fetch_all(client, energy_types: list[str]) -> dict:
+    nutzein, partner = await _discover_user_context(client)
     bis_literal, official_last_update_iso = await _discover_period(
-        request, nutzein, partner
+        client, nutzein, partner
     )
     bis_iso = bis_literal.split("'")[1][:10]
     _LOGGER.info(
@@ -691,7 +851,7 @@ async def _fetch_all(request, energy_types: list[str]) -> dict:
     index_map.append(("rooms", ""))
 
     payloads = await _odata_batch_get(
-        request,
+        client,
         _UVI_BASE,
         inner_gets,
         user_unit_id=nutzein,

@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 
 from _brunata_scraper import scrape
+from _env_utils import env_bool as _env_bool
+from _env_utils import read_env_file as _read_env_file
 
 _DEFAULT_LOGIN_URL = (
     "https://nutzerportal.brunata-muenchen.de/np_anmeldung/index.html?sap-language=DE"
@@ -27,35 +29,6 @@ _DEFAULT_SELECTORS = {
     "selector_date": "#__xmlview1--idConsumptionDate-inner",
     "selector_value": "#__xmlview1--idConsumptionValue-inner",
 }
-
-
-def _read_env_file(env_path: Path) -> dict[str, str]:
-    """Read KEY=VALUE pairs from a .env file."""
-    if not env_path.is_file():
-        raise FileNotFoundError(f"Env file not found: {env_path}")
-
-    values: dict[str, str] = {}
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        raw = line.strip()
-        if not raw or raw.startswith("#"):
-            continue
-        if raw.startswith("export "):
-            raw = raw[7:].strip()
-        if "=" not in raw:
-            continue
-        key, value = raw.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            values[key] = value
-    return values
-
-
-def _env_bool(value: str, default: bool) -> bool:
-    """Parse boolean-ish env values."""
-    if value == "":
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _build_config_from_env(env: dict[str, str]) -> dict:

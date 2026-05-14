@@ -1,0 +1,11 @@
+# Local development + investigation tooling.
+#
+# The production add-on (server.py / _brunata_api.py / _brunata_backfill.py)
+# runs on requirements.txt alone — pure HTTP, no browser. Playwright is only
+# needed for the browser-driven investigation scripts (explore_portal.py,
+# probe_login.py) and the legacy DOM scraper (_brunata_scraper.py).
+#
+#   pip install -r requirements-dev.txt
+#   python -m playwright install chromium
+-r requirements.txt
+playwright>=1.40.0

@@ -1,7 +1,8 @@
 """Brunata Fetcher add-on — main server.
 
-Reads /data/options.json (injected by HAOS supervisor), scrapes the Brunata
-Nutzerportal via Playwright, and publishes results as MQTT Discovery sensors.
+Reads /data/options.json (injected by HAOS supervisor), fetches consumption
+data from the Brunata Nutzerportal over plain HTTP, and publishes results as
+MQTT Discovery sensors.
 """
 
 from __future__ import annotations
@@ -100,11 +101,10 @@ _PERSISTENT_NOTIFICATION_ID = "brunata_fetcher_portal_query_failed"
 
 _BACKFILL_COMMAND_TOPIC = "brunata_fetcher/cmd/backfill"
 
-# Playwright per-action timeout. Bumped up from the API default because
-# Brunata's SAPUI5 login bootstrap is slow on Pi-class hardware running off
-# an SD card, and we'd rather wait than fail a fetch/backfill that would
-# eventually succeed.
-_PLAYWRIGHT_TIMEOUT_MS = 180_000
+# Per-request HTTP timeout (seconds). Generous because the SAP backend can
+# be slow to answer the first call of a cycle on a cold connection, and we'd
+# rather wait than fail a fetch/backfill that would otherwise succeed.
+_HTTP_TIMEOUT_S = 180
 
 
 # --- MQTT helpers ------------------------------------------------------------
@@ -754,15 +754,11 @@ def _send_failure_notification() -> bool:
 async def _run_fetch(options: dict) -> dict | None:
     """Build fetcher config from add-on options and call the OData fetcher."""
     start = time.monotonic()
-    advanced = options.get("advanced")
-    debug = bool(advanced.get("debug")) if isinstance(advanced, dict) else False
     config = {
         "email": options["email"],
         "password": options["password"],
         "energy_types": _normalize_energy_types(options.get("energy_types")),
-        "headless": True,
-        "debug": debug,
-        "playwright_timeout": _PLAYWRIGHT_TIMEOUT_MS,
+        "http_timeout": _HTTP_TIMEOUT_S,
     }
     _LOGGER.info("Fetch run start: energy_types=%s", config["energy_types"])
     try:
@@ -809,14 +805,13 @@ async def _backfill_watcher(
             continue
         async with lock:
             try:
-                _LOGGER.info("Backfill: acquired Playwright lock, starting")
+                _LOGGER.info("Backfill: acquired fetch lock, starting")
                 await _brunata_backfill(
                     supervisor_token=token,
                     email=options["email"],
                     password=options["password"],
                     energy_types=energy_types,
-                    headless=True,
-                    playwright_timeout=_PLAYWRIGHT_TIMEOUT_MS,
+                    http_timeout=_HTTP_TIMEOUT_S,
                 )
                 _LOGGER.info("Backfill: complete")
             except Exception:
@@ -854,9 +849,10 @@ async def main() -> None:
     _publish_discovery(mqtt_client, energy_types)
     _clear_removed_energy_type_entities(mqtt_client, energy_types)
 
-    # Serialize Playwright between live fetches and on-demand backfills so we
-    # don't launch two Chromium instances at once on memory-constrained hosts.
-    playwright_lock = asyncio.Lock()
+    # Serialize live fetches and on-demand backfills so we never hold two
+    # portal sessions open at once — politer to the SAP backend, and avoids
+    # interleaved logins racing on the shared cookie jar.
+    fetch_lock = asyncio.Lock()
     backfill_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -872,7 +868,7 @@ async def main() -> None:
     _LOGGER.info("Subscribed to backfill command topic: %s", _BACKFILL_COMMAND_TOPIC)
 
     asyncio.create_task(
-        _backfill_watcher(backfill_event, playwright_lock, options, energy_types)
+        _backfill_watcher(backfill_event, fetch_lock, options, energy_types)
     )
 
     cycle = 0
@@ -884,7 +880,7 @@ async def main() -> None:
         cycle_start = time.monotonic()
         run_started_at = datetime.now(UTC)
         _LOGGER.info("Cycle %d starting fetch", cycle)
-        async with playwright_lock:
+        async with fetch_lock:
             data = await _run_fetch(options)
         is_valid_result = False
         if data is not None:

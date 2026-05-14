@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- The add-on no longer bundles a browser. It now logs in to the Brunata
+  portal directly over HTTP instead of driving a headless Chromium. The
+  effect for you: the add-on image is dramatically smaller and faster to
+  install and update, it uses noticeably less memory, and the login
+  timeouts that could happen on slower hardware (Raspberry Pi on an SD
+  card) are gone. Each fetch cycle is a bit quicker too. No configuration
+  changes, and the entities in Home Assistant are exactly the same.
+
 ## 0.3.13
 
 - Improved backfill reliability. The automatic seam-fix now waits for

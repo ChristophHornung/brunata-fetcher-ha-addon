@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from _brunata_api import fetch
-from run_scraper_once import _env_bool, _read_env_file
+from _env_utils import read_env_file as _read_env_file
 
 
 def _build_config(env: dict[str, str]) -> dict:
@@ -32,17 +32,13 @@ def _build_config(env: dict[str, str]) -> dict:
     if not energy_types:
         raise ValueError("No energy types configured in BRUNATA_ENERGY_TYPES")
 
-    headless = _env_bool(env.get("BRUNATA_HEADLESS", "true"), True)
-    debug = _env_bool(env.get("BRUNATA_DEBUG", ""), False)
-    playwright_timeout = int(env.get("BRUNATA_PLAYWRIGHT_TIMEOUT_MS", "30000"))
+    http_timeout = float(env.get("BRUNATA_HTTP_TIMEOUT_S", "60"))
 
     return {
         "email": email,
         "password": password,
         "energy_types": energy_types,
-        "headless": headless,
-        "debug": debug,
-        "playwright_timeout": playwright_timeout,
+        "http_timeout": http_timeout,
     }
 
 

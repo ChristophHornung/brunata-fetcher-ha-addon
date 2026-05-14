@@ -2,28 +2,80 @@
 
 This document captures what we learned by observing the SAPUI5 frontend at
 `https://nutzerportal.brunata-muenchen.de/`. The portal is a SAP NetWeaver
-backend with OData v2 services. After interactive login, all data is fetched
-through `POST /sap/opu/odata/.../$batch` requests that wrap inner OData GETs in
+backend with OData v2 services. After login, all data is fetched through
+`POST /sap/opu/odata/.../$batch` requests that wrap inner OData GETs in
 multipart/mixed envelopes.
 
-Captured 2026-05-12 against the production portal.
+Captured 2026-05-12, login flow captured 2026-05-14, against the production
+portal.
 
 ## Authentication
 
-Login is done against `https://nutzerportal.brunata-muenchen.de/np_anmeldung/`
-using the standard form fields:
+Login is a **two-step plain-HTTP flow** against `NP_REG_LOGON_SRV_01` — no
+browser, no JS. It reproduces exactly what the SAPUI5 "Anmelden" button does
+under the hood.
 
-| Selector | Field |
-|---|---|
-| `#__component0---Start--idEmailInput-inner` | email |
-| `#__component0---Start--idPassword-inner` | password |
-| `button:has-text("Anmelden")` | submit |
+### Step 1 — validate credentials
 
-Authentication state is held in cookies (SAP session cookies). To make
-``$batch`` POSTs we additionally need an ``X-CSRF-Token``, which is obtained
-by sending ``HEAD <service>/?sap-client=201`` with the header
-``X-CSRF-Token: Fetch``. The token comes back in the ``X-CSRF-Token``
-response header and stays valid for the lifetime of the session.
+POST the email + password to `NP_REG_LOGON_SRV_01/CredentialSet` inside a
+`$batch` **changeset** (a changeset is required because it's a POST, not a
+GET):
+
+```
+POST /sap/opu/odata/bme/NP_REG_LOGON_SRV_01/$batch?sap-client=201
+Content-Type: multipart/mixed; boundary=batch_...
+
+  --batch_...
+  Content-Type: multipart/mixed; boundary=changeset_...
+
+    --changeset_...
+    Content-Type: application/http
+    Content-Transfer-Encoding: binary
+
+    POST CredentialSet?sap-client=201 HTTP/1.1
+    Content-Type: application/json
+
+    {"Action":"validLCR","Email":"<email>","Password":"<base64(plaintext)>"}
+    --changeset_...--
+  --batch_...--
+```
+
+The password is **Base64-encoded plaintext** — no hashing, no salt, no
+client-side crypto. The outer `$batch` POST always answers `HTTP 202`; the
+real result is the **inner** response:
+
+- **Success** → inner `HTTP/1.1 201 Created`, body
+  `{"d":{"Action":"validLCR","Userid":"N00000042054","Serviceurl":"nutzerportal.brunata-muenchen.de/np_dienste",...}}`.
+  This step only *validates* — it sets **no** session cookies.
+- **Failure** → inner `HTTP/1.1 400` with an OData error envelope,
+  `code: /BME/KP_MSG_CORE/008` ("Die Benutzerkennung oder das Kennwort sind
+  ungültig.").
+
+### Step 2 — open the session
+
+GET the `Serviceurl` returned by step 1, with HTTP Basic auth using the
+**`Userid`** (`N00000042054` — *not* the email) and the plaintext password:
+
+```
+GET https://nutzerportal.brunata-muenchen.de/np_dienste
+Authorization: Basic base64("<Userid>:<password>")
+```
+
+SAP answers this with `Set-Cookie: MYSAPSSO2` (the SSO logon ticket) +
+`SAP_SESSIONID_GP1_201` (the session). Those cookies authenticate every
+subsequent OData call — the fetcher just keeps reusing the same cookie jar.
+
+An optional `HEAD NP_REG_LOGON_SRV_01/?sap-client=201` before step 1 seeds the
+`sap-usercontext` cookie; the SAPUI5 frontend does it, so the fetcher mirrors
+it, but the flow works without it.
+
+### CSRF token (data services only)
+
+`$batch` POSTs to the **data** services need an `X-CSRF-Token`, obtained by
+`HEAD <service>/?sap-client=201` with header `X-CSRF-Token: Fetch`. The token
+comes back in the `X-CSRF-Token` response header and stays valid for the
+session. The login `$batch` POST itself does **not** need a CSRF token — it's
+the session-creating call.
 
 ## SAP context headers — required for `$batch`
 
@@ -213,29 +265,31 @@ daily bump tightly, schedule the polling to fire after 18:00 local time;
 otherwise the addon's once-daily cycle on whatever clock alignment it
 landed on is fine.
 
-## Why we still use Playwright at all
+## Playwright is investigation-only
 
-The login itself goes through a SAPUI5 form with anti-CSRF tokens we don't
-manually want to chase. Once Playwright drives the login successfully, we hand
-the `BrowserContext.request` object to the data layer — it shares the cookie
-jar and CSRF state, so subsequent `POST /$batch` calls work without further
-fuss.
+The production add-on (`server.py` / `_brunata_api.py` / `_brunata_backfill.py`)
+talks to the portal entirely over plain HTTP via `httpx` — login included
+(see Authentication above). **No browser is installed in the container.**
 
-Login + Playwright launch is a one-time ~3 s cost per cycle. If we ever want
-to eliminate Playwright entirely, the next investigation step is:
+Playwright lives on purely for **investigation**, and only in the dev
+environment (`pip install -r requirements-dev.txt` + `playwright install
+chromium`):
 
-1. Capture the exact login `POST` payload (currently skipped by the network
-   logger to keep the password out of the JSONL).
-2. Capture the SAP `X-CSRF-Token` round-trip.
-3. Reproduce both with `urllib.request` / `aiohttp`.
+- `explore_portal.py` — interactive non-headless browser; logs in, opens
+  Verbrauch, lets you click around while a network logger writes
+  `portal_network.jsonl` to the system temp dir.
+- `probe_login.py` — drives the browser login and records every
+  request/response, so you can see what the SAPUI5 "Anmelden" button sends.
+  This is how the two-step HTTP login above was reverse-engineered.
+- `_brunata_scraper.py` (+ `run_scraper_once.py`) — the legacy DOM-scraping
+  code path, kept as a reference fallback.
 
-For now Playwright stays.
+If the portal ever changes its login or data flow, drive it with the browser
+again to see what changed, then port the fix back into the HTTP path. The
+SAPUI5 login form selectors, for that investigation:
 
-## Investigation tooling (preserved)
-
-The DOM-scraping code path lives on as `brunata_fetcher/_brunata_scraper.py`
-and is still wired through `run_scraper_once.py`. The interactive explorer
-`brunata_fetcher/explore_portal.py` opens a non-headless browser, logs in,
-navigates to Verbrauch, and lets you click around while a network logger
-writes `portal_network.jsonl` to the system temp dir. Use these to probe new
-API surfaces before adding them to the main flow.
+| Selector | Field |
+|---|---|
+| `#__component0---Start--idEmailInput-inner` | email |
+| `#__component0---Start--idPassword-inner` | password |
+| `button:has-text("Anmelden")` | submit |
