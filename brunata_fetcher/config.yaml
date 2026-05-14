@@ -25,8 +25,6 @@ options:
     mqtt_port: 1883
     mqtt_user: ""
     mqtt_password: ""
-    scraper_url: "https://nutzerportal.brunata-muenchen.de/np_anmeldung/index.html?sap-language=DE"
-    debug: false
 
 schema:
   email: email
@@ -41,5 +39,3 @@ schema:
     mqtt_port: "port"
     mqtt_user: "str?"
     mqtt_password: "password?"
-    scraper_url: "url?"
-    debug: "bool?"

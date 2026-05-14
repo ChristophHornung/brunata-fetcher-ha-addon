@@ -75,7 +75,7 @@ python -m py_compile _brunata_api.py _brunata_backfill.py server.py
 
 For the API/data investigation helpers (`explore_portal.py`, `probe_login.py`, `probe_freshness.py`, `dump_monthly.py`, `analyze_hdd.py`, …) see the next section.
 
-Local credentials live in [`brunata_fetcher/.env`](brunata_fetcher/.env) (gitignored). `BRUNATA_DEBUG=true` enables HTML/screenshot/network-log dumps to `tempfile.gettempdir()` during any run.
+Local credentials live in [`brunata_fetcher/.env`](brunata_fetcher/.env) (gitignored). `BRUNATA_DEBUG=true` enables HTML/screenshot/network-log dumps to `tempfile.gettempdir()` during the browser-driven investigation runs (see Debug artifacts below).
 
 ## Analysis & investigation scripts
 
@@ -95,7 +95,7 @@ Dependency-wise they split two ways:
 
 ## Debug artifacts
 
-When `BRUNATA_DEBUG=true` (either via `.env` for local runs, or `advanced.debug: true` in the addon options for container runs), both the API and scraper modules write to the system temp dir:
+`BRUNATA_DEBUG=true` in `.env` enables diagnostic dumps from the **browser-driven** investigation paths only — the legacy `_brunata_scraper.py` (via `run_scraper_once.py`) and `explore_portal.py`. There is no addon-side debug option: the production httpx path doesn't write dumps (use the investigation scripts instead). Artifacts land in the system temp dir:
 
 - `portal_debug{1..5}.{html,png}` — page snapshots during the scraper login flow
 - `portal_network.jsonl` — every request/response with method/URL/status/body. POST bodies are captured **except** for the login URL (which contains the password). Multipart `$batch` bodies are captured in full so you can inspect inner OData GETs.

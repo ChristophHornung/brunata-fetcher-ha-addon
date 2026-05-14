@@ -57,12 +57,6 @@ Advanced options:
 
 - `mqtt_host` / `mqtt_port` / `mqtt_user` / `mqtt_password` — leave empty
   to let the add-on resolve MQTT through Supervisor's `/services/mqtt`
-- `debug` — when on, the add-on writes `portal_debug{1..5}.{html,png}`
-  and `portal_network.jsonl` to the container's temp dir for diagnosis.
-  Off by default.
-
-The `scraper_url` advanced option is preserved for back-compat but no
-longer drives behaviour — the OData endpoints are hard-coded.
 
 ## Published entities
 
@@ -157,8 +151,8 @@ persistent notification.
   `MQTT broker connection acknowledged` on a healthy boot.
 - `LOGIN_FAILED` in the log → check `email` / `password`.
 - A `/BME/KP_MSG_CORE/224` 500 from the portal → likely an API change.
-  See `docs/portal-api.md` for the reverse-engineered protocol, then
-  flip `advanced.debug: true` to capture `portal_network.jsonl`.
+  See `docs/portal-api.md` for the reverse-engineered protocol; reproduce
+  it locally with the investigation scripts to see what changed.
 - No entities appear → confirm the HA MQTT integration is loaded and the
   broker is reachable.
 
