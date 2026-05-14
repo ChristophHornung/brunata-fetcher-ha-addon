@@ -1,0 +1,6 @@
+# Per-architecture base image. Read by the HA Supervisor for local builds,
+# and mirrored by the GitHub builder workflow's BUILD_FROM build-arg
+# (.github/workflows/builder.yaml) for the pre-built GHCR images.
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base-debian:bookworm
+  aarch64: ghcr.io/home-assistant/aarch64-base-debian:bookworm
