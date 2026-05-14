@@ -7,6 +7,7 @@ entities via MQTT Discovery.
 Keywords: Brunata München Nutzerportal, BRUdirekt, BRUNATA-METRONA.
 
 [![Open your Home Assistant instance and show the add-on repository dialog with this repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FChristophHornung%2Fbrunata-fetcher-ha-addon)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-donate-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/chorn)
 
 ## Features
 
