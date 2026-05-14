@@ -203,3 +203,7 @@ python explore_portal.py                  # interactive non-headless explorer
 
 `BRUNATA_DEBUG=true` in `.env` enables extra diagnostic dumps to the system
 temp dir during the browser-driven runs above.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
