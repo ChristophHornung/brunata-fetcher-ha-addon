@@ -14,7 +14,7 @@ The codebase shifted from DOM scraping to a cookie-authed OData API in **v0.3.0*
 
 - **Production path:** [`brunata_fetcher/_brunata_api.py`](brunata_fetcher/_brunata_api.py). Playwright logs in (one-shot, to obtain SAP session cookies); subsequent data fetches POST to `NP_UVI_SRV/$batch` directly. A full cycle is ~10s.
 - **Legacy/fallback path:** [`brunata_fetcher/_brunata_scraper.py`](brunata_fetcher/_brunata_scraper.py). DOM-scrapes the Verbrauch widget via Playwright. ~19s, brittle to portal UI changes. Kept as a reference and for emergency fallback.
-- **Investigation tooling:** [`explore_portal.py`](brunata_fetcher/explore_portal.py) (interactive non-headless browser with network logger), [`explore_uvi_dates.py`](brunata_fetcher/explore_uvi_dates.py) (one-shot probe for API parameter behavior). Use these when the API changes before touching production code.
+- **Investigation tooling:** several non-production helper scripts for poking at the portal API and the consumption data — see [Analysis & investigation scripts](#analysis--investigation-scripts). Reach for them when the API changes or the data looks off, before touching production code.
 
 [`server.py`](brunata_fetcher/server.py) is the long-running HA entrypoint — reads `/data/options.json`, connects to MQTT, runs the fetch loop, publishes Discovery + state.
 
@@ -63,18 +63,23 @@ python run_api_once.py
 # End-to-end against the real portal via the legacy DOM scraper
 python run_scraper_once.py
 
-# Interactive non-headless explorer — logs in, opens Verbrauch, hands you
-# the browser. Click around; all traffic captured to %TEMP%/portal_network.jsonl
-python explore_portal.py
-
-# One-shot probe of NP_UVI_SRV Bis/Datum parameter behavior
-python explore_uvi_dates.py
-
 # Compile-check before committing
 python -m py_compile _brunata_api.py server.py
 ```
 
+For the API/data investigation helpers (`explore_portal.py`, `probe_freshness.py`, `dump_monthly.py`, `analyze_hdd.py`, …) see the next section.
+
 Local credentials live in [`brunata_fetcher/.env`](brunata_fetcher/.env) (gitignored). `BRUNATA_DEBUG=true` enables HTML/screenshot/network-log dumps to `tempfile.gettempdir()` during any run.
+
+## Analysis & investigation scripts
+
+Non-production helpers for poking at the portal API and the consumption data — **internal tooling, not shipped or referenced by the addon**. None are wired into `server.py`; all need `.env` credentials and run from `brunata_fetcher/`. Keep them around: they're the first thing to reach for when the API changes or the data looks wrong, before editing production code.
+
+- `explore_portal.py` — interactive non-headless browser. Logs in, opens the Verbrauch page, hands you the browser to click around. All traffic captured to `%TEMP%/portal_network.jsonl`.
+- `explore_uvi_dates.py` — one-shot probe of `NP_UVI_SRV` `Bis`/`Datum` parameter behaviour (how the portal interprets non-month-end `Bis`, ignores `Datum` filters, etc.).
+- `probe_freshness.py` — dumps the full OData row structure of `UserContextSet` / `DatesSet` / `CumuConsumptionMonSet` (we only parse 2 of ~10 fields in production) plus the `$metadata` entity-set + property inventory. Written to answer "does the portal expose a last-refreshed timestamp?" — it doesn't, but `Vbkz='E'` on a `CumuConsumptionMonSet` row flags the in-progress month's *estimated* value vs. `Vbkz=''` for closed months.
+- `dump_monthly.py` — prints per-month raw + weather-adjusted (`IsWeatherAdjusted`) Heizung values across all years, mirroring exactly what the backfill imports. Good for sanity-checking the WB sensor.
+- `analyze_hdd.py` — joins the per-month data with Open-Meteo historical temperatures, computes German G20/15 Heating Degree Days, and derives `kWh/HDD` per month and year. Takes `--lat` / `--lon`. Used to gut-check whether the portal's witterungsbereinigt numbers actually behave like a real weather normalization (spoiler: not really).
 
 ## Debug artifacts
 
