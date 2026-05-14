@@ -1,4 +1,8 @@
-ARG BUILD_FROM
+# BUILD_FROM is supplied per-architecture — by build.yaml for HA Supervisor
+# local builds, or by the builder workflow's build-arg for the pre-built GHCR
+# images. The default is just a fallback so a plain `docker build` doesn't
+# choke on an empty FROM.
+ARG BUILD_FROM=ghcr.io/home-assistant/aarch64-base-debian:bookworm
 FROM ${BUILD_FROM}
 
 # Python runtime. The HA base is minimal; install python + pip and drop the
