@@ -254,16 +254,25 @@ end-of-month readings.
 
 ### How often the preliminary value actually updates
 
-Empirically (observed over a multi-day run): Brunata refreshes the
-preliminary current-month `Verbrauch` **once per day**, in the late
-afternoon — in one observed case the new value showed up shortly after
-17:00 local time. Polling more often than once a day returns the same
-preliminary value over and over. The default `scan_interval_hours: 24`
-is therefore already correct; anything shorter mostly wastes Pi CPU /
-SD writes / Brunata's rate limit headroom. If you want to *catch* the
-daily bump tightly, schedule the polling to fire after 18:00 local time;
-otherwise the addon's once-daily cycle on whatever clock alignment it
-landed on is fine.
+**Irregular and infrequent.** Observed over a longer run: the
+preliminary current-month `Verbrauch` (the "Prognose" in the portal UI,
+flagged `Vbkz='E'` in the API) can sit unchanged for **several days at
+a time** between recomputations. Brunata gives no documented schedule
+and the API exposes no "last refreshed" timestamp (see `probe_freshness.py`
+findings), so we can't predict when the next jump will land.
+
+Practical consequences:
+
+- The default `scan_interval_hours: 24` is already aggressive; lowering
+  it just polls the same number repeatedly. There's no benefit unless
+  you want tighter latency on the eventual update.
+- A stable value over multiple days is not a sign anything is broken —
+  the add-on faithfully publishes whatever the portal returns each
+  cycle. Sanity-check against the portal UI's "Prognose" if it ever
+  feels wrong.
+- The closed-month values (`Vbkz=''`) and `last_update_date` only tick
+  when Brunata actually finalises a month, typically a few days into
+  the following month.
 
 ## Playwright is investigation-only
 

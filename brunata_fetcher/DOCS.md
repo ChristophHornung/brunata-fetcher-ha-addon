@@ -47,3 +47,7 @@ re-run.
 - `LOGIN_FAILED` in the log → check your `email` and `password`.
 - No entities appear → make sure the Home Assistant MQTT integration is
   set up and the broker is reachable.
+- Values haven't changed in days → almost always normal. Brunata
+  recomputes the current month's "Prognose" (forecast) on an irregular
+  schedule and it can sit unchanged for several days at a time. Compare
+  against the Prognose number in the Brunata portal UI to confirm.
